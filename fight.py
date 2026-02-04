@@ -3,21 +3,19 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 # ----------------- Auto install requirements -----------------
-# NOTE: Auto-install works best inside Docker.
 PIP_DEPS = [
     "telethon==1.36.0",
     "tgcrypto==1.2.5",
     "yt-dlp==2025.01.26",
-    # pytgcalls dev builds are most stable for Telethon + modern tg calls
-    "pytgcalls==3.0.0.dev24",
+    "py-tgcalls==1.0.0",  # FIXED: Stable version
 ]
 
 def ensure_deps():
     try:
-        import telethon  # noqa
-        import tgcrypto  # noqa
-        import yt_dlp    # noqa
-        import pytgcalls # noqa
+        import telethon
+        import tgcrypto
+        import yt_dlp
+        import pytgcalls
         return
     except Exception:
         pass
@@ -38,8 +36,8 @@ from telethon.errors import (
     PhoneCodeInvalidError,
 )
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
-from pytgcalls.exceptions import GroupCallNotFoundError
+from pytgcalls.types import AudioPiped, StreamAudioEnded
+from pytgcalls.exceptions import GroupCallNotFound
 import yt_dlp
 
 
@@ -49,7 +47,7 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-DATA_DIR = os.getenv("DATA_DIR", "/data")
+DATA_DIR = os.getenv("DATA_DIR", "./data")  # FIXED: Local fallback
 DEFAULT_SESSION_PATH = os.path.join(DATA_DIR, "default.session")
 USER_SESSION_DIR = os.path.join(DATA_DIR, "usersessions")
 SUDO_FILE = os.path.join(DATA_DIR, "sudo.json")
@@ -83,7 +81,7 @@ def is_allowed(uid: int) -> bool:
 
 async def guard(event) -> bool:
     if not is_allowed(event.sender_id):
-        await event.respond("Access denied. Ye bot sirf Owner/Sudo users use kar sakte.")
+        await event.respond("❌ Access denied. Ye bot sirf Owner/Sudo users use kar sakte.")
         return False
     return True
 
@@ -105,10 +103,13 @@ def parse_invite_hash(link: str) -> Optional[str]:
     return None
 
 async def ytdlp_get_direct_audio(url: str) -> str:
-    """
-    Returns direct audio URL (ffmpeg can read).
-    """
-    ydl_opts = {"format": "bestaudio/best", "noplaylist": True, "quiet": True}
+    """Returns direct audio URL (ffmpeg can read)."""
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
     loop = asyncio.get_running_loop()
 
     def _extract():
@@ -133,10 +134,9 @@ async def ensure_join_and_get_chat_id(user_client: TelegramClient, link: str) ->
             if res.chats:
                 return res.chats[0].id
         except UserAlreadyParticipantError:
-            # already joined, continue to resolve below
             pass
         except (InviteHashInvalidError, InviteHashExpiredError):
-            raise ValueError("Invite link invalid/expired.")
+            raise ValueError("❌ Invite link invalid/expired.")
         except Exception as e:
             raise RuntimeError(f"Invite join error: {e}")
 
@@ -193,6 +193,14 @@ async def get_calls(session_file: str) -> PyTgCalls:
     uc = await get_user_client(session_file)
     calls = PyTgCalls(uc)
     await calls.start()
+    
+    # FIXED: Add stream ended handler
+    @calls.on_stream_end()
+    async def on_end(client, update):
+        chat_id = update.chat_id
+        key = (session_file, chat_id)
+        await play_next(session_file, chat_id)
+    
     calls_cache[session_file] = calls
     return calls
 
@@ -206,12 +214,15 @@ async def join_or_switch(session_file: str, chat_id: int, item: QueueItem):
     calls = await get_calls(session_file)
     stream = await build_stream(item)
     try:
-        await calls.join_group_call(chat_id, stream)
-    except GroupCallNotFoundError:
-        raise RuntimeError("Group me Voice Chat ON nahi hai. Pehle VC start karo.")
-    except Exception:
-        # already joined -> switch
-        await calls.change_stream(chat_id, stream)
+        await calls.play(chat_id, stream)  # FIXED: Use play() instead of join_group_call()
+    except GroupCallNotFound:
+        raise RuntimeError("❌ Group me Voice Chat ON nahi hai. Pehle VC start karo.")
+    except Exception as e:
+        # already joined -> change stream
+        try:
+            await calls.change_stream(chat_id, stream)
+        except:
+            raise RuntimeError(f"Stream switch error: {e}")
 
 async def play_next(session_file: str, chat_id: int) -> bool:
     key = (session_file, chat_id)
@@ -230,28 +241,48 @@ async def play_next(session_file: str, chat_id: int) -> bool:
     return True
 
 # ================== LOGIN FLOW ==================
+# FIXED: Custom wait_for implementation
+pending_responses: Dict[int, asyncio.Future] = {}
+
+@bot.on(events.NewMessage)
+async def response_handler(event):
+    if event.sender_id in pending_responses:
+        future = pending_responses.pop(event.sender_id)
+        if not future.done():
+            future.set_result(event)
+
+async def wait_for_response(user_id: int, timeout: int = 120) -> events.NewMessage.Event:
+    """Custom wait_for implementation"""
+    future = asyncio.Future()
+    pending_responses[user_id] = future
+    try:
+        return await asyncio.wait_for(future, timeout=timeout)
+    except asyncio.TimeoutError:
+        pending_responses.pop(user_id, None)
+        raise RuntimeError("⏱️ Timeout: Response nahi mila")
+
 async def do_phone_login(event, session_file: str, phone: str):
     client = TelegramClient(session_file, API_ID, API_HASH)
     await client.connect()
 
     sent = await client.send_code_request(phone)
-    await event.respond("OTP bhej diya. Ab OTP bhejo (12345 ya 1 2 3 4 5).")
+    await event.respond("📱 OTP bhej diya. Ab OTP bhejo (12345 ya 1 2 3 4 5).")
 
-    otp_event = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
+    otp_event = await wait_for_response(event.sender_id)  # FIXED
     code = re.sub(r"\s+", "", otp_event.raw_text.strip())
 
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
     except PhoneCodeInvalidError:
         await client.disconnect()
-        raise RuntimeError("OTP galat hai.")
+        raise RuntimeError("❌ OTP galat hai.")
     except SessionPasswordNeededError:
-        await event.respond("2FA enabled hai. Apna 2FA password bhejo.")
-        pw_event = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
+        await event.respond("🔐 2FA enabled hai. Apna 2FA password bhejo.")
+        pw_event = await wait_for_response(event.sender_id)  # FIXED
         await client.sign_in(password=pw_event.raw_text.strip())
 
     await client.disconnect()
-    await event.respond("Login success ✅ Session save ho gaya.")
+    await event.respond("✅ Login success! Session save ho gaya.")
 
 # ================== /start button flow ==================
 @dataclass
@@ -262,29 +293,33 @@ class FlowState:
 
 flows: Dict[int, FlowState] = {}
 
-START_BTNS = [[Button.inline("Default", b"mode:default"), Button.inline("Login", b"mode:login")]]
+START_BTNS = [[Button.inline("🔧 Default", b"mode:default"), Button.inline("👤 Login", b"mode:login")]]
 
-HELP = (
-    "Owner/Sudo only VC bot\n\n"
-    "Auth:\n"
-    "/setdefault (owner)  - default account login\n"
-    "/login              - your account login\n"
-    "/logout             - remove your session\n"
-    "/sudo <id|@user> (owner)\n"
-    "/rmsudo <id|@user> (owner)\n"
-    "/sudolist\n\n"
-    "Play:\n"
-    "/start -> buttons flow\n"
-    "/play (reply audio)  -> then ask group link\n"
-    "/ytplay <url>        -> then ask group link\n"
-    "/pause <group_link>\n"
-    "/resume <group_link>\n"
-    "/skip <group_link>\n"
-    "/stop <group_link>\n"
-    "/leave <group_link>\n"
-    "/queue <group_link>\n"
-    "/now <group_link>\n"
-)
+HELP = """
+🎵 **Owner/Sudo Only VC Bot**
+
+**Auth Commands:**
+/setdefault - Default account login (owner only)
+/login - Your account login
+/logout - Remove your session
+/sudo <id|@user> - Add sudo (owner only)
+/rmsudo <id|@user> - Remove sudo (owner only)
+/sudolist - List all sudos
+
+**Play Commands:**
+/start - Interactive mode
+/play (reply to audio) - Play audio file
+/ytplay <url> - Play YouTube video
+/pause <group_link> - Pause playback
+/resume <group_link> - Resume playback
+/skip <group_link> - Skip current
+/stop <group_link> - Stop & clear queue
+/leave <group_link> - Leave voice chat
+/queue <group_link> - Show queue
+/now <group_link> - Current playing
+
+**Note:** Voice chat ON hona chahiye group mein!
+"""
 
 async def resolve_user_id(arg: str) -> int:
     arg = arg.strip()
@@ -308,74 +343,74 @@ async def help_cmd(event):
 async def start_cmd(event):
     if not await guard(event): return
     flows[event.sender_id] = FlowState(mode="", step="idle")
-    await event.respond("Mode select karo:", buttons=START_BTNS)
+    await event.respond("👋 **Mode select karo:**", buttons=START_BTNS)
 
 @bot.on(events.CallbackQuery(pattern=b"mode:(default|login)"))
 async def mode_cb(event):
     if not is_allowed(event.sender_id):
-        return await event.answer("Access denied", alert=True)
+        return await event.answer("❌ Access denied", alert=True)
     mode = event.pattern_match.group(1).decode()
     flows[event.sender_id] = FlowState(mode=mode, step="ask_group")
-    await event.edit(f"Mode: **{mode}**\nGroup link bhejo (public ya private invite):")
+    await event.edit(f"✅ Mode: **{mode}**\n\n📍 Group link bhejo (public ya private invite):")
 
 @bot.on(events.NewMessage(pattern=r"^/sudo\s+(.+)$"))
 async def sudo_add(event):
     if not await guard(event): return
     if not is_owner(event.sender_id):
-        return await event.respond("Only owner can /sudo")
+        return await event.respond("❌ Only owner can /sudo")
     try:
         uid = await resolve_user_id(event.pattern_match.group(1))
         sudos = load_sudos()
         if uid not in sudos:
             sudos.append(uid)
             save_sudos(sudos)
-        await event.respond(f"Sudo added ✅ `{uid}`")
+        await event.respond(f"✅ Sudo added: `{uid}`")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/rmsudo\s+(.+)$"))
 async def sudo_rm(event):
     if not await guard(event): return
     if not is_owner(event.sender_id):
-        return await event.respond("Only owner can /rmsudo")
+        return await event.respond("❌ Only owner can /rmsudo")
     try:
         uid = await resolve_user_id(event.pattern_match.group(1))
         sudos = [x for x in load_sudos() if x != uid]
         save_sudos(sudos)
-        await event.respond(f"Sudo removed ✅ `{uid}`")
+        await event.respond(f"✅ Sudo removed: `{uid}`")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/sudolist$"))
 async def sudo_list(event):
     if not await guard(event): return
     sudos = load_sudos()
     if not sudos:
-        return await event.respond("Sudo list empty.")
-    await event.respond("Sudo users:\n" + "\n".join(f"- `{x}`" for x in sudos))
+        return await event.respond("📭 Sudo list empty.")
+    await event.respond("👥 **Sudo users:**\n" + "\n".join(f"• `{x}`" for x in sudos))
 
 @bot.on(events.NewMessage(pattern=r"^/setdefault$"))
 async def setdefault(event):
     if not await guard(event): return
     if not is_owner(event.sender_id):
-        return await event.respond("Only owner can /setdefault")
-    await event.respond("Default account phone do (+91xxxx):")
-    ph = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
+        return await event.respond("❌ Only owner can /setdefault")
+    await event.respond("📱 Default account phone do (+91xxxx):")
+    ph = await wait_for_response(event.sender_id)  # FIXED
     try:
         await do_phone_login(event, DEFAULT_SESSION_PATH, ph.raw_text.strip())
     except Exception as e:
-        await event.respond(f"Login failed: {e}")
+        await event.respond(f"❌ Login failed: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/login$"))
 async def login(event):
     if not await guard(event): return
     path = user_session_path(event.sender_id)
-    await event.respond("Apna account phone do (+91xxxx):")
-    ph = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
+    await event.respond("📱 Apna account phone do (+91xxxx):")
+    ph = await wait_for_response(event.sender_id)  # FIXED
     try:
         await do_phone_login(event, path, ph.raw_text.strip())
     except Exception as e:
-        await event.respond(f"Login failed: {e}")
+        await event.respond(f"❌ Login failed: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/logout$"))
 async def logout(event):
@@ -383,26 +418,26 @@ async def logout(event):
     path = user_session_path(event.sender_id)
     if os.path.exists(path):
         os.remove(path)
-        await event.respond("Logout ✅")
+        await event.respond("✅ Logout successful!")
     else:
-        await event.respond("Not logged in.")
+        await event.respond("❌ Not logged in.")
 
 # -------- button flow text router (group link + audio/yt) --------
-@bot.on(events.NewMessage())
+@bot.on(events.NewMessage)
 async def flow_router(event):
     if event.raw_text.startswith("/"):
         return
     if not is_allowed(event.sender_id):
         return
     st = flows.get(event.sender_id)
-    if not st:
+    if not st or st.step == "idle":
         return
 
     if st.step == "ask_group":
         st.group_link = event.raw_text.strip()
         st.step = "ask_source"
         flows[event.sender_id] = st
-        return await event.respond("Ab audio file bhejo ya YouTube URL paste karo:")
+        return await event.respond("🎵 Ab audio file bhejo ya YouTube URL paste karo:")
 
     if st.step == "ask_source":
         group_link = st.group_link or ""
@@ -411,19 +446,19 @@ async def flow_router(event):
         # session
         if mode == "default":
             if not default_session_ready():
-                return await event.respond("Default not set. Owner /setdefault.")
+                return await event.respond("❌ Default not set. Owner /setdefault kare.")
             session_file = DEFAULT_SESSION_PATH
         else:
             session_file = user_session_path(event.sender_id)
             if not os.path.exists(session_file):
-                return await event.respond("Pehle /login karke apna account login karo.")
+                return await event.respond("❌ Pehle /login karke apna account login karo.")
 
         # resolve/join group
         try:
             uc = await get_user_client(session_file)
             chat_id = await ensure_join_and_get_chat_id(uc, group_link)
         except Exception as e:
-            return await event.respond(f"Group join/resolve error: {e}")
+            return await event.respond(f"❌ Group join/resolve error: {e}")
 
         # source
         if event.media:
@@ -432,7 +467,7 @@ async def flow_router(event):
         else:
             text = event.raw_text.strip()
             if not is_youtube(text):
-                return await event.respond("Valid YouTube URL do ya audio file bhejo.")
+                return await event.respond("❌ Valid YouTube URL do ya audio file bhejo.")
             item = QueueItem(kind="yt", value=text, title="YouTube")
 
         # enqueue and play
@@ -444,19 +479,19 @@ async def flow_router(event):
         try:
             if not ps.playing:
                 await play_next(session_file, chat_id)
-                await event.respond("Playing ✅ (VC ON hona chahiye)")
+                await event.respond("▶️ Playing! (VC ON hona chahiye)")
             else:
-                await event.respond(f"Queued ✅ position: {len(ps.queue)}")
+                await event.respond(f"✅ Queued at position: {len(ps.queue)}")
         except Exception as e:
-            await event.respond(f"Play error: {e}")
+            await event.respond(f"❌ Play error: {e}")
 
         flows[event.sender_id] = FlowState(mode="", step="idle")
         return
 
-# -------- command play helpers (default account used for commands) --------
+# -------- command play helpers --------
 async def get_default_session() -> str:
     if not default_session_ready():
-        raise RuntimeError("Default not set. Owner must /setdefault.")
+        raise RuntimeError("❌ Default not set. Owner must /setdefault.")
     return DEFAULT_SESSION_PATH
 
 async def resolve_chat_by_link(session_file: str, link: str) -> int:
@@ -468,9 +503,9 @@ async def ytplay(event):
     if not await guard(event): return
     url = event.pattern_match.group(1).strip()
     if not is_youtube(url):
-        return await event.respond("Valid YouTube URL do.")
-    await event.respond("Group link bhejo:")
-    gl = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
+        return await event.respond("❌ Valid YouTube URL do.")
+    await event.respond("📍 Group link bhejo:")
+    gl = await wait_for_response(event.sender_id)  # FIXED
     link = gl.raw_text.strip()
 
     try:
@@ -484,22 +519,22 @@ async def ytplay(event):
 
         if not ps.playing:
             await play_next(session_file, chat_id)
-            await event.respond("Playing ✅")
+            await event.respond("▶️ Playing YouTube!")
         else:
-            await event.respond(f"Queued ✅ position: {len(ps.queue)}")
+            await event.respond(f"✅ Queued at position: {len(ps.queue)}")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/play$"))
 async def play_audio(event):
     if not await guard(event): return
     if not event.is_reply:
-        return await event.respond("Audio ko reply karke /play bhejo.")
+        return await event.respond("❌ Audio ko reply karke /play bhejo.")
     rep = await event.get_reply_message()
     if not rep.media:
-        return await event.respond("Reply me audio file hona chahiye.")
-    await event.respond("Group link bhejo:")
-    gl = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
+        return await event.respond("❌ Reply me audio file hona chahiye.")
+    await event.respond("📍 Group link bhejo:")
+    gl = await wait_for_response(event.sender_id)  # FIXED
     link = gl.raw_text.strip()
 
     try:
@@ -514,11 +549,11 @@ async def play_audio(event):
 
         if not ps.playing:
             await play_next(session_file, chat_id)
-            await event.respond("Playing ✅")
+            await event.respond("▶️ Playing audio!")
         else:
-            await event.respond(f"Queued ✅ position: {len(ps.queue)}")
+            await event.respond(f"✅ Queued at position: {len(ps.queue)}")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/skip\s+(.+)$"))
 async def skip(event):
@@ -528,9 +563,9 @@ async def skip(event):
         session_file = await get_default_session()
         chat_id = await resolve_chat_by_link(session_file, link)
         ok = await play_next(session_file, chat_id)
-        await event.respond("Skipped ✅" if ok else "Queue empty.")
+        await event.respond("⏭️ Skipped!" if ok else "📭 Queue empty.")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/stop\s+(.+)$"))
 async def stop(event):
@@ -552,9 +587,9 @@ async def stop(event):
             await calls.leave_group_call(chat_id)
         except:
             pass
-        await event.respond("Stopped ✅ (queue cleared + left VC)")
+        await event.respond("⏹️ Stopped! (Queue cleared + left VC)")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/leave\s+(.+)$"))
 async def leave(event):
@@ -565,9 +600,9 @@ async def leave(event):
         chat_id = await resolve_chat_by_link(session_file, link)
         calls = await get_calls(session_file)
         await calls.leave_group_call(chat_id)
-        await event.respond("Left VC ✅")
+        await event.respond("👋 Left VC!")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/pause\s+(.+)$"))
 async def pause(event):
@@ -578,9 +613,9 @@ async def pause(event):
         chat_id = await resolve_chat_by_link(session_file, link)
         calls = await get_calls(session_file)
         await calls.pause_stream(chat_id)
-        await event.respond("Paused ✅")
+        await event.respond("⏸️ Paused!")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/resume\s+(.+)$"))
 async def resume(event):
@@ -591,9 +626,9 @@ async def resume(event):
         chat_id = await resolve_chat_by_link(session_file, link)
         calls = await get_calls(session_file)
         await calls.resume_stream(chat_id)
-        await event.respond("Resumed ✅")
+        await event.respond("▶️ Resumed!")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/queue\s+(.+)$"))
 async def queue(event):
@@ -605,19 +640,19 @@ async def queue(event):
         key = (session_file, chat_id)
         ps = players.get(key)
         if not ps:
-            return await event.respond("No queue.")
+            return await event.respond("📭 No queue.")
         lines = []
         if ps.current:
-            lines.append(f"Now: **{ps.current.title or ps.current.kind}**")
+            lines.append(f"🎵 **Now:** {ps.current.title or ps.current.kind}")
         if ps.queue:
-            lines.append("Next:")
+            lines.append("\n📜 **Next:**")
             for i, it in enumerate(ps.queue[:20], 1):
                 lines.append(f"{i}. {it.title or it.kind}")
         else:
-            lines.append("Queue empty.")
+            lines.append("\n📭 Queue empty.")
         await event.respond("\n".join(lines))
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/now\s+(.+)$"))
 async def now(event):
@@ -628,15 +663,20 @@ async def now(event):
         chat_id = await resolve_chat_by_link(session_file, link)
         ps = players.get((session_file, chat_id))
         if not ps or not ps.current:
-            return await event.respond("Nothing playing.")
-        await event.respond(f"Now playing: **{ps.current.title or ps.current.kind}**")
+            return await event.respond("📭 Nothing playing.")
+        await event.respond(f"🎵 **Now playing:** {ps.current.title or ps.current.kind}")
     except Exception as e:
-        await event.respond(f"Error: {e}")
+        await event.respond(f"❌ Error: {e}")
 
 # ================== MAIN ==================
 async def main():
-    print("[OK] Bot running ...")
+    print("[✅ OK] Bot is running...")
+    print(f"[ℹ️] DATA_DIR: {DATA_DIR}")
+    print(f"[ℹ️] OWNER_ID: {OWNER_ID}")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[👋] Bot stopped by user.")
