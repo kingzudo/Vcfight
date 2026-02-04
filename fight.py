@@ -1,9 +1,32 @@
-import os
-import re
-import json
-import asyncio
+import os, sys, re, json, asyncio, subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+# ----------------- Auto install requirements -----------------
+# NOTE: Auto-install works best inside Docker.
+PIP_DEPS = [
+    "telethon==1.36.0",
+    "tgcrypto==1.2.5",
+    "yt-dlp==2025.01.26",
+    # pytgcalls dev builds are most stable for Telethon + modern tg calls
+    "pytgcalls==3.0.0.dev24",
+]
+
+def ensure_deps():
+    try:
+        import telethon  # noqa
+        import tgcrypto  # noqa
+        import yt_dlp    # noqa
+        import pytgcalls # noqa
+        return
+    except Exception:
+        pass
+
+    print("[BOOT] Installing Python dependencies ...")
+    for dep in PIP_DEPS:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", dep])
+
+ensure_deps()
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -14,18 +37,17 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
 )
-
 from pytgcalls import PyTgCalls
 from pytgcalls.types.input_stream import AudioPiped
 from pytgcalls.exceptions import GroupCallNotFoundError
-
 import yt_dlp
 
+
 # ================== ENV CONFIG ==================
-BOT_TOKEN = "7845373810:AAH5jWEJhLoObAwFXxjK6KFpwGZ2Y1N2fE0"
-API_ID = "33628258"
-API_HASH = "0850762925b9c1715b9b122f7b753128"
-OWNER_ID = "7661825494"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DEFAULT_SESSION_PATH = os.path.join(DATA_DIR, "default.session")
@@ -57,9 +79,13 @@ def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 def is_allowed(uid: int) -> bool:
-    if is_owner(uid):
-        return True
-    return uid in load_sudos()
+    return is_owner(uid) or (uid in load_sudos())
+
+async def guard(event) -> bool:
+    if not is_allowed(event.sender_id):
+        await event.respond("Access denied. Ye bot sirf Owner/Sudo users use kar sakte.")
+        return False
+    return True
 
 # ================== HELPERS ==================
 def user_session_path(user_id: int) -> str:
@@ -69,13 +95,6 @@ def is_youtube(url: str) -> bool:
     return bool(re.search(r"(youtube\.com|youtu\.be)", url, re.I))
 
 def parse_invite_hash(link: str) -> Optional[str]:
-    """
-    Supports:
-      - https://t.me/+HASH
-      - t.me/+HASH
-      - https://t.me/joinchat/HASH
-      - t.me/joinchat/HASH
-    """
     link = link.strip()
     m = re.search(r"t\.me/\+([A-Za-z0-9_-]+)", link)
     if m:
@@ -86,12 +105,10 @@ def parse_invite_hash(link: str) -> Optional[str]:
     return None
 
 async def ytdlp_get_direct_audio(url: str) -> str:
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "extract_flat": False,
-    }
+    """
+    Returns direct audio URL (ffmpeg can read).
+    """
+    ydl_opts = {"format": "bestaudio/best", "noplaylist": True, "quiet": True}
     loop = asyncio.get_running_loop()
 
     def _extract():
@@ -101,31 +118,28 @@ async def ytdlp_get_direct_audio(url: str) -> str:
 
     return await loop.run_in_executor(None, _extract)
 
-async def ensure_join_by_link(user_client: TelegramClient, link: str) -> int:
+async def ensure_join_and_get_chat_id(user_client: TelegramClient, link: str) -> int:
     """
-    Returns chat_id after ensuring membership for private invite links.
-    Public @username also supported.
+    Supports:
+      - public: @username / t.me/username
+      - private: t.me/+hash / t.me/joinchat/hash (imports invite)
     """
     link = link.strip()
 
-    invite_hash = parse_invite_hash(link)
-    if invite_hash:
+    inv = parse_invite_hash(link)
+    if inv:
         try:
-            res = await user_client(ImportChatInviteRequest(invite_hash))
-            # res.chats[0] should be the chat
+            res = await user_client(ImportChatInviteRequest(inv))
             if res.chats:
                 return res.chats[0].id
         except UserAlreadyParticipantError:
-            # Already joined; must resolve entity via invite? Telethon doesn't give chat id directly.
-            # We'll try get_entity via full link fallback.
+            # already joined, continue to resolve below
             pass
         except (InviteHashInvalidError, InviteHashExpiredError):
             raise ValueError("Invite link invalid/expired.")
         except Exception as e:
-            # If something else happens
             raise RuntimeError(f"Invite join error: {e}")
 
-    # Public link / @username / entity
     if link.startswith("@"):
         ent = await user_client.get_entity(link)
         return ent.id
@@ -133,54 +147,51 @@ async def ensure_join_by_link(user_client: TelegramClient, link: str) -> int:
     if "t.me/" in link:
         slug = link.split("t.me/")[-1].split("?")[0].strip("/")
         if slug.startswith("+") or slug.startswith("joinchat/"):
-            # already handled above
-            raise ValueError("Invite link parse failed. Recheck your link.")
+            raise ValueError("Invite link parse failed. Recheck link.")
         ent = await user_client.get_entity(slug)
         return ent.id
 
     ent = await user_client.get_entity(link)
     return ent.id
 
-# ================== PLAYBACK STATE (QUEUE) ==================
+
+# ================== PLAYER STATE ==================
 @dataclass
 class QueueItem:
-    kind: str                 # "file" or "yt"
-    value: str                # file path or yt url
+    kind: str   # "file" | "yt"
+    value: str
     title: str = ""
 
 @dataclass
 class PlayerState:
     queue: List[QueueItem] = field(default_factory=list)
     current: Optional[QueueItem] = None
-    volume: int = 100
     playing: bool = False
 
-# key: (session_file, chat_id)
 players: Dict[Tuple[str, int], PlayerState] = {}
 
-# ================== BOT CLIENT ==================
+# ================== CLIENT CACHES ==================
 bot = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# ================== SESSION CLIENT CACHES ==================
 client_cache: Dict[str, TelegramClient] = {}
 calls_cache: Dict[str, PyTgCalls] = {}
 
 async def get_user_client(session_file: str) -> TelegramClient:
     if session_file in client_cache:
         return client_cache[session_file]
-    client = TelegramClient(session_file, API_ID, API_HASH)
-    await client.connect()
-    if not await client.is_user_authorized():
-        await client.disconnect()
-        raise RuntimeError("Session not authorized. Please login.")
-    client_cache[session_file] = client
-    return client
+    c = TelegramClient(session_file, API_ID, API_HASH)
+    await c.connect()
+    if not await c.is_user_authorized():
+        await c.disconnect()
+        raise RuntimeError("Session not authorized. Login required.")
+    client_cache[session_file] = c
+    return c
 
 async def get_calls(session_file: str) -> PyTgCalls:
     if session_file in calls_cache:
         return calls_cache[session_file]
-    user_client = await get_user_client(session_file)
-    calls = PyTgCalls(user_client)
+    uc = await get_user_client(session_file)
+    calls = PyTgCalls(uc)
     await calls.start()
     calls_cache[session_file] = calls
     return calls
@@ -191,23 +202,21 @@ async def build_stream(item: QueueItem) -> AudioPiped:
         return AudioPiped(direct)
     return AudioPiped(item.value)
 
-async def join_and_play(session_file: str, chat_id: int, item: QueueItem):
+async def join_or_switch(session_file: str, chat_id: int, item: QueueItem):
     calls = await get_calls(session_file)
     stream = await build_stream(item)
     try:
         await calls.join_group_call(chat_id, stream)
     except GroupCallNotFoundError:
-        raise RuntimeError("Group me active voice chat nahi chal raha. Pehle VC start karo.")
+        raise RuntimeError("Group me Voice Chat ON nahi hai. Pehle VC start karo.")
     except Exception:
-        # already joined -> switch stream
+        # already joined -> switch
         await calls.change_stream(chat_id, stream)
 
-async def play_next(session_file: str, chat_id: int):
+async def play_next(session_file: str, chat_id: int) -> bool:
     key = (session_file, chat_id)
-    st = players.get(key)
-    if not st:
-        st = PlayerState()
-        players[key] = st
+    st = players.get(key) or PlayerState()
+    players[key] = st
 
     if not st.queue:
         st.current = None
@@ -217,10 +226,10 @@ async def play_next(session_file: str, chat_id: int):
     item = st.queue.pop(0)
     st.current = item
     st.playing = True
-    await join_and_play(session_file, chat_id, item)
+    await join_or_switch(session_file, chat_id, item)
     return True
 
-# ================== LOGIN FLOW (OTP/2FA) ==================
+# ================== LOGIN FLOW ==================
 async def do_phone_login(event, session_file: str, phone: str):
     client = TelegramClient(session_file, API_ID, API_HASH)
     await client.connect()
@@ -239,99 +248,83 @@ async def do_phone_login(event, session_file: str, phone: str):
     except SessionPasswordNeededError:
         await event.respond("2FA enabled hai. Apna 2FA password bhejo.")
         pw_event = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
-        password = pw_event.raw_text.strip()
-        await client.sign_in(password=password)
+        await client.sign_in(password=pw_event.raw_text.strip())
 
     await client.disconnect()
     await event.respond("Login success ✅ Session save ho gaya.")
 
-# ================== UI FLOW (/start buttons) ==================
+# ================== /start button flow ==================
 @dataclass
 class FlowState:
-    mode: str     # "default" or "login"
+    mode: str     # "default" | "login"
     step: str     # "idle" | "ask_group" | "ask_source"
     group_link: Optional[str] = None
 
-user_flow: Dict[int, FlowState] = {}
+flows: Dict[int, FlowState] = {}
 
-START_BTNS = [[
-    Button.inline("Default", b"mode:default"),
-    Button.inline("Login", b"mode:login"),
-]]
+START_BTNS = [[Button.inline("Default", b"mode:default"), Button.inline("Login", b"mode:login")]]
 
-# ================== GUARDS ==================
-async def guard(event) -> bool:
-    if not is_allowed(event.sender_id):
-        await event.respond("Access denied. Ye bot sirf Owner/Sudo users use kar sakte.")
-        return False
-    return True
-
-# ================== COMMANDS ==================
-HELP_TEXT = (
-    "**Commands**\n"
-    "Auth/Admin:\n"
-    "  /sudo <user_id|@username>  - add sudo (owner only)\n"
-    "  /rmsudo <user_id|@username> - remove sudo (owner only)\n"
-    "  /sudolist - list sudo users\n"
-    "  /setdefault - default account login (owner only)\n"
-    "  /login - apna account login (owner/sudo)\n"
-    "  /logout - apna account logout\n\n"
-    "Playback:\n"
-    "  /play (reply audio) - audio queue\n"
-    "  /ytplay <url> - youtube queue\n"
-    "  /join <group_link> - VC join (no play)\n"
-    "  /leave <group_link> - VC leave\n"
-    "  /pause <group_link>\n"
-    "  /resume <group_link>\n"
-    "  /skip <group_link>\n"
-    "  /stop <group_link> - stop and clear queue\n"
-    "  /queue <group_link>\n"
-    "  /now <group_link>\n"
+HELP = (
+    "Owner/Sudo only VC bot\n\n"
+    "Auth:\n"
+    "/setdefault (owner)  - default account login\n"
+    "/login              - your account login\n"
+    "/logout             - remove your session\n"
+    "/sudo <id|@user> (owner)\n"
+    "/rmsudo <id|@user> (owner)\n"
+    "/sudolist\n\n"
+    "Play:\n"
+    "/start -> buttons flow\n"
+    "/play (reply audio)  -> then ask group link\n"
+    "/ytplay <url>        -> then ask group link\n"
+    "/pause <group_link>\n"
+    "/resume <group_link>\n"
+    "/skip <group_link>\n"
+    "/stop <group_link>\n"
+    "/leave <group_link>\n"
+    "/queue <group_link>\n"
+    "/now <group_link>\n"
 )
-
-@bot.on(events.NewMessage(pattern=r"^/help$"))
-async def help_cmd(event):
-    if not await guard(event): return
-    await event.respond(HELP_TEXT)
-
-@bot.on(events.NewMessage(pattern=r"^/start$"))
-async def start_cmd(event):
-    if not await guard(event): return
-    user_flow[event.sender_id] = FlowState(mode="", step="idle")
-    await event.respond("VC Bot Mode select karo:", buttons=START_BTNS)
-
-@bot.on(events.CallbackQuery(pattern=b"mode:(default|login)"))
-async def mode_cb(event):
-    if not is_allowed(event.sender_id):
-        return await event.answer("Access denied", alert=True)
-
-    mode = event.pattern_match.group(1).decode()
-    user_flow[event.sender_id] = FlowState(mode=mode, step="ask_group")
-    await event.edit(f"Mode: **{mode}**\n\nAb group invite link/@username bhejo:")
 
 async def resolve_user_id(arg: str) -> int:
     arg = arg.strip()
     if arg.isdigit():
         return int(arg)
-    if arg.startswith("@"):
-        ent = await bot.get_entity(arg)
-        return ent.id
-    # allow raw username without @
-    if re.match(r"^[A-Za-z0-9_]{4,}$", arg):
-        ent = await bot.get_entity(arg)
-        return ent.id
-    raise ValueError("Invalid user argument")
+    if not arg.startswith("@") and re.match(r"^[A-Za-z0-9_]{4,}$", arg):
+        arg = "@" + arg
+    ent = await bot.get_entity(arg)
+    return ent.id
 
-@bot.on(events.NewMessage(pattern=r"^/sudo(?:\s+(.+))?$"))
+def default_session_ready() -> bool:
+    return os.path.exists(DEFAULT_SESSION_PATH)
+
+# ================== HANDLERS ==================
+@bot.on(events.NewMessage(pattern=r"^/help$"))
+async def help_cmd(event):
+    if not await guard(event): return
+    await event.respond(HELP)
+
+@bot.on(events.NewMessage(pattern=r"^/start$"))
+async def start_cmd(event):
+    if not await guard(event): return
+    flows[event.sender_id] = FlowState(mode="", step="idle")
+    await event.respond("Mode select karo:", buttons=START_BTNS)
+
+@bot.on(events.CallbackQuery(pattern=b"mode:(default|login)"))
+async def mode_cb(event):
+    if not is_allowed(event.sender_id):
+        return await event.answer("Access denied", alert=True)
+    mode = event.pattern_match.group(1).decode()
+    flows[event.sender_id] = FlowState(mode=mode, step="ask_group")
+    await event.edit(f"Mode: **{mode}**\nGroup link bhejo (public ya private invite):")
+
+@bot.on(events.NewMessage(pattern=r"^/sudo\s+(.+)$"))
 async def sudo_add(event):
     if not await guard(event): return
     if not is_owner(event.sender_id):
-        return await event.respond("Sirf owner /sudo use kar sakta.")
-    arg = event.pattern_match.group(1)
-    if not arg:
-        return await event.respond("Usage: /sudo <user_id|@username>")
+        return await event.respond("Only owner can /sudo")
     try:
-        uid = await resolve_user_id(arg)
+        uid = await resolve_user_id(event.pattern_match.group(1))
         sudos = load_sudos()
         if uid not in sudos:
             sudos.append(uid)
@@ -340,18 +333,14 @@ async def sudo_add(event):
     except Exception as e:
         await event.respond(f"Error: {e}")
 
-@bot.on(events.NewMessage(pattern=r"^/rmsudo(?:\s+(.+))?$"))
+@bot.on(events.NewMessage(pattern=r"^/rmsudo\s+(.+)$"))
 async def sudo_rm(event):
     if not await guard(event): return
     if not is_owner(event.sender_id):
-        return await event.respond("Sirf owner /rmsudo use kar sakta.")
-    arg = event.pattern_match.group(1)
-    if not arg:
-        return await event.respond("Usage: /rmsudo <user_id|@username>")
+        return await event.respond("Only owner can /rmsudo")
     try:
-        uid = await resolve_user_id(arg)
-        sudos = load_sudos()
-        sudos = [x for x in sudos if x != uid]
+        uid = await resolve_user_id(event.pattern_match.group(1))
+        sudos = [x for x in load_sudos() if x != uid]
         save_sudos(sudos)
         await event.respond(f"Sudo removed ✅ `{uid}`")
     except Exception as e:
@@ -363,82 +352,78 @@ async def sudo_list(event):
     sudos = load_sudos()
     if not sudos:
         return await event.respond("Sudo list empty.")
-    txt = "**Sudo Users:**\n" + "\n".join(f"- `{x}`" for x in sudos)
-    await event.respond(txt)
+    await event.respond("Sudo users:\n" + "\n".join(f"- `{x}`" for x in sudos))
 
 @bot.on(events.NewMessage(pattern=r"^/setdefault$"))
 async def setdefault(event):
     if not await guard(event): return
     if not is_owner(event.sender_id):
-        return await event.respond("Sirf owner /setdefault use kar sakta.")
-    await event.respond("Default account set: phone number bhejo (+91xxxxxxxxxx).")
-    phone_event = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
-    phone = phone_event.raw_text.strip()
+        return await event.respond("Only owner can /setdefault")
+    await event.respond("Default account phone do (+91xxxx):")
+    ph = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
     try:
-        await do_phone_login(event, DEFAULT_SESSION_PATH, phone)
+        await do_phone_login(event, DEFAULT_SESSION_PATH, ph.raw_text.strip())
     except Exception as e:
         await event.respond(f"Login failed: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/login$"))
-async def login_cmd(event):
+async def login(event):
     if not await guard(event): return
     path = user_session_path(event.sender_id)
-    await event.respond("Apna account login: phone number bhejo (+91xxxxxxxxxx).")
-    phone_event = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
-    phone = phone_event.raw_text.strip()
+    await event.respond("Apna account phone do (+91xxxx):")
+    ph = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
     try:
-        await do_phone_login(event, path, phone)
+        await do_phone_login(event, path, ph.raw_text.strip())
     except Exception as e:
         await event.respond(f"Login failed: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/logout$"))
-async def logout_cmd(event):
+async def logout(event):
     if not await guard(event): return
     path = user_session_path(event.sender_id)
     if os.path.exists(path):
         os.remove(path)
-        await event.respond("Logout ✅ session deleted.")
+        await event.respond("Logout ✅")
     else:
-        await event.respond("Tum logged in nahi ho.")
+        await event.respond("Not logged in.")
 
-# ============== MODE BUTTON FLOW (Default/Login) ==============
+# -------- button flow text router (group link + audio/yt) --------
 @bot.on(events.NewMessage())
-async def start_flow_router(event):
+async def flow_router(event):
     if event.raw_text.startswith("/"):
         return
     if not is_allowed(event.sender_id):
         return
-
-    st = user_flow.get(event.sender_id)
+    st = flows.get(event.sender_id)
     if not st:
         return
 
     if st.step == "ask_group":
         st.group_link = event.raw_text.strip()
         st.step = "ask_source"
-        user_flow[event.sender_id] = st
-        return await event.respond("Ab audio file bhejo ya YouTube URL paste karo.")
+        flows[event.sender_id] = st
+        return await event.respond("Ab audio file bhejo ya YouTube URL paste karo:")
 
     if st.step == "ask_source":
         group_link = st.group_link or ""
         mode = st.mode
 
-        # pick session
+        # session
         if mode == "default":
-            if not os.path.exists(DEFAULT_SESSION_PATH):
-                return await event.respond("Default account set nahi. Owner /setdefault kare.")
+            if not default_session_ready():
+                return await event.respond("Default not set. Owner /setdefault.")
             session_file = DEFAULT_SESSION_PATH
         else:
             session_file = user_session_path(event.sender_id)
             if not os.path.exists(session_file):
                 return await event.respond("Pehle /login karke apna account login karo.")
 
-        # resolve chat and enqueue
+        # resolve/join group
         try:
-            user_client = await get_user_client(session_file)
-            chat_id = await ensure_join_by_link(user_client, group_link)
+            uc = await get_user_client(session_file)
+            chat_id = await ensure_join_and_get_chat_id(uc, group_link)
         except Exception as e:
-            return await event.respond(f"Group resolve/join error: {e}")
+            return await event.respond(f"Group join/resolve error: {e}")
 
         # source
         if event.media:
@@ -446,73 +431,51 @@ async def start_flow_router(event):
             item = QueueItem(kind="file", value=local_path, title=os.path.basename(local_path))
         else:
             text = event.raw_text.strip()
-            if is_youtube(text):
-                item = QueueItem(kind="yt", value=text, title="YouTube")
-            else:
-                return await event.respond("Audio file bhejo ya valid YouTube URL do.")
+            if not is_youtube(text):
+                return await event.respond("Valid YouTube URL do ya audio file bhejo.")
+            item = QueueItem(kind="yt", value=text, title="YouTube")
 
+        # enqueue and play
         key = (session_file, chat_id)
         ps = players.get(key) or PlayerState()
         ps.queue.append(item)
         players[key] = ps
 
-        await event.respond("Queued ✅ VC start hoga/stream switch hoga.")
-
-        # if not currently playing, start
         try:
             if not ps.playing:
                 await play_next(session_file, chat_id)
-                await event.respond("Playing ✅")
+                await event.respond("Playing ✅ (VC ON hona chahiye)")
             else:
-                await event.respond(f"Queue position: {len(ps.queue)}")
+                await event.respond(f"Queued ✅ position: {len(ps.queue)}")
         except Exception as e:
             await event.respond(f"Play error: {e}")
 
-        user_flow[event.sender_id] = FlowState(mode="", step="idle")
+        flows[event.sender_id] = FlowState(mode="", step="idle")
         return
 
-# ================== PLAYBACK COMMANDS ==================
-async def get_session_for_user(uid: int, use_default: bool) -> str:
-    if use_default:
-        if not os.path.exists(DEFAULT_SESSION_PATH):
-            raise RuntimeError("Default account not set. Owner /setdefault.")
-        return DEFAULT_SESSION_PATH
-    path = user_session_path(uid)
-    if not os.path.exists(path):
-        raise RuntimeError("You are not logged in. Use /login first.")
-    return path
+# -------- command play helpers (default account used for commands) --------
+async def get_default_session() -> str:
+    if not default_session_ready():
+        raise RuntimeError("Default not set. Owner must /setdefault.")
+    return DEFAULT_SESSION_PATH
 
-@bot.on(events.NewMessage(pattern=r"^/join\s+(.+)$"))
-async def join_cmd(event):
-    if not await guard(event): return
-    link = event.pattern_match.group(1).strip()
-    # join with default by default (owner/sudo convenience)
-    try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
-        calls = await get_calls(session_file)
-        # join with silent stream? pytgcalls requires stream; we just won't join without play.
-        await event.respond("Join command received. Use /ytplay or /play to start streaming.")
-        return
-    except Exception as e:
-        await event.respond(f"Join error: {e}")
+async def resolve_chat_by_link(session_file: str, link: str) -> int:
+    uc = await get_user_client(session_file)
+    return await ensure_join_and_get_chat_id(uc, link)
 
 @bot.on(events.NewMessage(pattern=r"^/ytplay\s+(.+)$"))
-async def ytplay_cmd(event):
+async def ytplay(event):
     if not await guard(event): return
     url = event.pattern_match.group(1).strip()
     if not is_youtube(url):
         return await event.respond("Valid YouTube URL do.")
-
-    await event.respond("Group link bhejo (public @username ya private invite).")
+    await event.respond("Group link bhejo:")
     gl = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
     link = gl.raw_text.strip()
 
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
 
         key = (session_file, chat_id)
         ps = players.get(key) or PlayerState()
@@ -528,28 +491,25 @@ async def ytplay_cmd(event):
         await event.respond(f"Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/play$"))
-async def play_cmd(event):
+async def play_audio(event):
     if not await guard(event): return
     if not event.is_reply:
         return await event.respond("Audio ko reply karke /play bhejo.")
     rep = await event.get_reply_message()
     if not rep.media:
         return await event.respond("Reply me audio file hona chahiye.")
-    await event.respond("Group link bhejo (public @username ya private invite).")
+    await event.respond("Group link bhejo:")
     gl = await bot.wait_for(events.NewMessage(from_users=event.sender_id))
     link = gl.raw_text.strip()
 
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
-
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
         local_path = await rep.download_media(file=DATA_DIR)
-        item = QueueItem(kind="file", value=local_path, title=os.path.basename(local_path))
 
         key = (session_file, chat_id)
         ps = players.get(key) or PlayerState()
-        ps.queue.append(item)
+        ps.queue.append(QueueItem(kind="file", value=local_path, title=os.path.basename(local_path)))
         players[key] = ps
 
         if not ps.playing:
@@ -561,31 +521,24 @@ async def play_cmd(event):
         await event.respond(f"Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/skip\s+(.+)$"))
-async def skip_cmd(event):
+async def skip(event):
     if not await guard(event): return
     link = event.pattern_match.group(1).strip()
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
-
-        key = (session_file, chat_id)
-        ps = players.get(key)
-        if not ps or (not ps.playing and not ps.queue):
-            return await event.respond("Nothing playing/queued.")
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
         ok = await play_next(session_file, chat_id)
         await event.respond("Skipped ✅" if ok else "Queue empty.")
     except Exception as e:
         await event.respond(f"Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/stop\s+(.+)$"))
-async def stop_cmd(event):
+async def stop(event):
     if not await guard(event): return
     link = event.pattern_match.group(1).strip()
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
 
         key = (session_file, chat_id)
         ps = players.get(key) or PlayerState()
@@ -597,42 +550,32 @@ async def stop_cmd(event):
         calls = await get_calls(session_file)
         try:
             await calls.leave_group_call(chat_id)
-        except Exception:
+        except:
             pass
-
-        await event.respond("Stopped ✅ left VC and cleared queue.")
+        await event.respond("Stopped ✅ (queue cleared + left VC)")
     except Exception as e:
         await event.respond(f"Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/leave\s+(.+)$"))
-async def leave_cmd(event):
+async def leave(event):
     if not await guard(event): return
     link = event.pattern_match.group(1).strip()
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
-
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
         calls = await get_calls(session_file)
         await calls.leave_group_call(chat_id)
-
-        key = (session_file, chat_id)
-        if key in players:
-            players[key].playing = False
-
         await event.respond("Left VC ✅")
     except Exception as e:
         await event.respond(f"Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/pause\s+(.+)$"))
-async def pause_cmd(event):
+async def pause(event):
     if not await guard(event): return
     link = event.pattern_match.group(1).strip()
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
-
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
         calls = await get_calls(session_file)
         await calls.pause_stream(chat_id)
         await event.respond("Paused ✅")
@@ -640,14 +583,12 @@ async def pause_cmd(event):
         await event.respond(f"Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/resume\s+(.+)$"))
-async def resume_cmd(event):
+async def resume(event):
     if not await guard(event): return
     link = event.pattern_match.group(1).strip()
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
-
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
         calls = await get_calls(session_file)
         await calls.resume_stream(chat_id)
         await event.respond("Resumed ✅")
@@ -655,24 +596,21 @@ async def resume_cmd(event):
         await event.respond(f"Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/queue\s+(.+)$"))
-async def queue_cmd(event):
+async def queue(event):
     if not await guard(event): return
     link = event.pattern_match.group(1).strip()
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
-
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
         key = (session_file, chat_id)
         ps = players.get(key)
         if not ps:
             return await event.respond("No queue.")
-
         lines = []
         if ps.current:
-            lines.append(f"**Now:** {ps.current.title or ps.current.kind}")
+            lines.append(f"Now: **{ps.current.title or ps.current.kind}**")
         if ps.queue:
-            lines.append("**Up Next:**")
+            lines.append("Next:")
             for i, it in enumerate(ps.queue[:20], 1):
                 lines.append(f"{i}. {it.title or it.kind}")
         else:
@@ -682,15 +620,13 @@ async def queue_cmd(event):
         await event.respond(f"Error: {e}")
 
 @bot.on(events.NewMessage(pattern=r"^/now\s+(.+)$"))
-async def now_cmd(event):
+async def now(event):
     if not await guard(event): return
     link = event.pattern_match.group(1).strip()
     try:
-        session_file = await get_session_for_user(event.sender_id, use_default=True)
-        user_client = await get_user_client(session_file)
-        chat_id = await ensure_join_by_link(user_client, link)
-        key = (session_file, chat_id)
-        ps = players.get(key)
+        session_file = await get_default_session()
+        chat_id = await resolve_chat_by_link(session_file, link)
+        ps = players.get((session_file, chat_id))
         if not ps or not ps.current:
             return await event.respond("Nothing playing.")
         await event.respond(f"Now playing: **{ps.current.title or ps.current.kind}**")
@@ -699,7 +635,7 @@ async def now_cmd(event):
 
 # ================== MAIN ==================
 async def main():
-    print("Bot running...")
+    print("[OK] Bot running ...")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
