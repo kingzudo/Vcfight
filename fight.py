@@ -22,10 +22,10 @@ from pytgcalls.exceptions import GroupCallNotFoundError
 import yt_dlp
 
 # ================== ENV CONFIG ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+BOT_TOKEN = "7845373810:AAH5jWEJhLoObAwFXxjK6KFpwGZ2Y1N2fE0"
+API_ID = "33628258"
+API_HASH = "0850762925b9c1715b9b122f7b753128"
+OWNER_ID = "7661825494"
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DEFAULT_SESSION_PATH = os.path.join(DATA_DIR, "default.session")

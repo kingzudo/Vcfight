@@ -17,4 +17,4 @@ COPY app/ /app/
 ENV DATA_DIR=/data
 VOLUME ["/data"]
 
-CMD ["python", "main.py"]
+CMD ["python", "fight.py"]
