@@ -5,7 +5,9 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid, PasswordHashInvalid, FloodWait
 from pytgcalls import PyTgCalls
-from pytgcalls.types import StreamType
+from pytgcalls.types import AudioPiped, Stream, StreamAudioEnded
+from pytgcalls.types.input_stream import AudioParameters, AudioVideoPiped
+from pytgcalls.types.input_stream.quality import HighQualityAudio
 import yt_dlp
 import logging
 from pathlib import Path
@@ -42,6 +44,7 @@ default_account = None
 user_accounts = {}
 default_calls = None
 user_calls = {}
+active_streams = {}
 
 # User state management
 class UserState:
@@ -114,7 +117,8 @@ async def start_command(client, message: Message):
             "• **Login My Account**: Use your own account\n\n"
             "**Owner Commands:**\n"
             "• /setdefault - Setup default account\n"
-            "• /logout - Logout from your account",
+            "• /logout - Logout from your account\n"
+            "• /stop - Stop playing audio",
             reply_markup=keyboard
         )
     except Exception as e:
@@ -133,6 +137,41 @@ async def set_default_account(client, message: Message):
         logger.error(f"Setdefault error: {e}")
         await send_error_to_owner(f"Setdefault error: {str(e)}")
 
+# Stop command
+@bot.on_message(filters.command("stop") & filters.private)
+async def stop_command(client, message: Message):
+    try:
+        user_id = message.from_user.id
+        stopped = False
+        
+        # Try to stop user's own call
+        if user_id in user_calls and user_id in active_streams:
+            try:
+                chat_id = active_streams[user_id]
+                await user_calls[user_id].leave_group_call(chat_id)
+                del active_streams[user_id]
+                stopped = True
+            except:
+                pass
+        
+        # If owner, also try default account
+        if user_id == OWNER_ID and default_calls and "default" in active_streams:
+            try:
+                chat_id = active_streams["default"]
+                await default_calls.leave_group_call(chat_id)
+                del active_streams["default"]
+                stopped = True
+            except:
+                pass
+        
+        if stopped:
+            await message.reply_text("✅ Stopped playing audio!")
+        else:
+            await message.reply_text("❌ No active audio playing!")
+    except Exception as e:
+        logger.error(f"Stop error: {e}")
+        await message.reply_text(f"❌ Error: {str(e)}")
+
 # Logout command
 @bot.on_message(filters.command("logout") & filters.private)
 async def logout_command(client, message: Message):
@@ -142,7 +181,9 @@ async def logout_command(client, message: Message):
             try:
                 if user_id in user_calls:
                     try:
-                        await user_calls[user_id].stop()
+                        if user_id in active_streams:
+                            await user_calls[user_id].leave_group_call(active_streams[user_id])
+                            del active_streams[user_id]
                     except:
                         pass
                     del user_calls[user_id]
@@ -195,7 +236,7 @@ async def callback_handler(client, callback_query):
         await send_error_to_owner(f"Callback error: {str(e)}")
 
 # Message handler for steps
-@bot.on_message(filters.private & filters.text & ~filters.command(["start", "setdefault", "logout"]))
+@bot.on_message(filters.private & filters.text & ~filters.command(["start", "setdefault", "logout", "stop"]))
 async def message_handler(client, message: Message):
     global default_account, default_calls
     
@@ -384,9 +425,11 @@ async def message_handler(client, message: Message):
             if mode == "default":
                 client_to_use = default_account
                 calls_to_use = default_calls
+                stream_key = "default"
             else:
                 client_to_use = user_accounts.get(user_id)
                 calls_to_use = user_calls.get(user_id)
+                stream_key = user_id
 
             if not client_to_use or not calls_to_use:
                 await message.reply_text("❌ Session expired! Please start again with /start")
@@ -431,14 +474,16 @@ async def message_handler(client, message: Message):
             try:
                 await processing_msg.edit_text("⏳ Joining voice chat...")
                 
-                # Join voice chat and play
+                # Join voice chat and play with new API
                 await calls_to_use.join_group_call(
                     actual_chat_id,
-                    audio_path,
-                    stream_type=StreamType().local_stream
+                    AudioPiped(audio_path),
+                    stream_type=StreamAudioEnded.LOCAL_STREAM
                 )
                 
-                await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!")
+                active_streams[stream_key] = actual_chat_id
+                
+                await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!\n\nUse /stop to stop playing.")
                 state.step = None
                 
             except Exception as e:
@@ -446,7 +491,7 @@ async def message_handler(client, message: Message):
                 if "No active group call" in error_msg or "GROUP_CALL_INVALID" in error_msg or "not found" in error_msg.lower():
                     await processing_msg.edit_text("❌ **No Active Voice Chat!**\n\nPlease:\n1. Start a voice chat in the group\n2. Make sure the account is admin or can join voice chat\n3. Try again")
                 elif "Already joined" in error_msg or "GROUPCALL_ALREADY_STARTED" in error_msg:
-                    await processing_msg.edit_text("❌ Already playing in this group! Please wait for current audio to finish.")
+                    await processing_msg.edit_text("❌ Already playing in this group! Please use /stop first.")
                 else:
                     await processing_msg.edit_text(f"❌ Error: {error_msg}\n\nMake sure:\n• Voice chat is active\n• Account has permission to join")
                     await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
@@ -477,9 +522,11 @@ async def audio_file_handler(client, message: Message):
         if mode == "default":
             client_to_use = default_account
             calls_to_use = default_calls
+            stream_key = "default"
         else:
             client_to_use = user_accounts.get(user_id)
             calls_to_use = user_calls.get(user_id)
+            stream_key = user_id
 
         if not client_to_use or not calls_to_use:
             await message.reply_text("❌ Session expired! Please start again with /start")
@@ -514,14 +561,16 @@ async def audio_file_handler(client, message: Message):
         try:
             await processing_msg.edit_text("⏳ Joining voice chat...")
             
-            # Join voice chat and play
+            # Join voice chat and play with new API
             await calls_to_use.join_group_call(
                 actual_chat_id,
-                audio_path,
-                stream_type=StreamType().local_stream
+                AudioPiped(audio_path),
+                stream_type=StreamAudioEnded.LOCAL_STREAM
             )
             
-            await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!")
+            active_streams[stream_key] = actual_chat_id
+            
+            await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!\n\nUse /stop to stop playing.")
             state.step = None
             
         except Exception as e:
@@ -529,7 +578,7 @@ async def audio_file_handler(client, message: Message):
             if "No active group call" in error_msg or "GROUP_CALL_INVALID" in error_msg or "not found" in error_msg.lower():
                 await processing_msg.edit_text("❌ **No Active Voice Chat!**\n\nPlease:\n1. Start a voice chat in the group\n2. Make sure the account is admin or can join voice chat\n3. Try again")
             elif "Already joined" in error_msg or "GROUPCALL_ALREADY_STARTED" in error_msg:
-                await processing_msg.edit_text("❌ Already playing in this group! Please wait for current audio to finish.")
+                await processing_msg.edit_text("❌ Already playing in this group! Please use /stop first.")
             else:
                 await processing_msg.edit_text(f"❌ Error: {error_msg}\n\nMake sure:\n• Voice chat is active\n• Account has permission to join")
                 await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
