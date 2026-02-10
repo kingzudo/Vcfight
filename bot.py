@@ -4,9 +4,10 @@ import re
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid, PasswordHashInvalid, FloodWait
-from pytgcalls import PyTgCalls, idle
-from pytgcalls.types import MediaStream, AudioQuality
-from pytgcalls.exceptions import NoActiveGroupCall, AlreadyJoinedError, NotInCallError
+from pytgcalls import PyTgCalls
+from pytgcalls.types import AudioPiped, Update
+from pytgcalls.types.input_stream import AudioParameters, InputAudioStream
+from pytgcalls.types.input_stream.quality import HighQualityAudio
 import yt_dlp
 import logging
 from pathlib import Path
@@ -198,7 +199,7 @@ async def callback_handler(client, callback_query):
 # Message handler for steps
 @bot.on_message(filters.private & filters.text & ~filters.command(["start", "setdefault", "logout"]))
 async def message_handler(client, message: Message):
-    global default_account, default_calls  # ✅ FIX: Pehle global declare karo
+    global default_account, default_calls
     
     user_id = message.from_user.id
     state = get_user_state(user_id)
@@ -432,28 +433,34 @@ async def message_handler(client, message: Message):
             try:
                 await processing_msg.edit_text("⏳ Joining voice chat...")
                 
-                await calls_to_use.play(
+                await calls_to_use.join_group_call(
                     actual_chat_id,
-                    MediaStream(
-                        audio_path,
-                        audio_parameters=AudioQuality.HIGH
-                    )
+                    AudioPiped(audio_path),
+                    stream_type=StreamType().pulse_stream
                 )
                 
                 await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!")
                 state.step = None
                 
-            except NoActiveGroupCall:
-                await processing_msg.edit_text("❌ **No Active Voice Chat!**\n\nPlease start a voice chat in the group first, then try again.")
-                state.step = None
-            except AlreadyJoinedError:
-                await processing_msg.edit_text("❌ Already playing in this group! Please wait for current audio to finish.")
-                state.step = None
             except Exception as e:
-                error_msg = str(e)
-                await processing_msg.edit_text(f"❌ Error playing audio: {error_msg}")
-                await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
-                state.step = None
+                # Try alternative method
+                try:
+                    await calls_to_use.play(
+                        actual_chat_id,
+                        audio_path
+                    )
+                    await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!")
+                    state.step = None
+                except Exception as e2:
+                    error_msg = str(e2)
+                    if "No active group call" in error_msg or "GROUP_CALL_INVALID" in error_msg:
+                        await processing_msg.edit_text("❌ **No Active Voice Chat!**\n\nPlease start a voice chat in the group first, then try again.")
+                    elif "Already joined" in error_msg:
+                        await processing_msg.edit_text("❌ Already playing in this group! Please wait for current audio to finish.")
+                    else:
+                        await processing_msg.edit_text(f"❌ Error playing audio: {error_msg}")
+                        await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
+                    state.step = None
             finally:
                 # Cleanup after delay
                 asyncio.create_task(cleanup_file(audio_path))
@@ -517,28 +524,34 @@ async def audio_file_handler(client, message: Message):
         try:
             await processing_msg.edit_text("⏳ Joining voice chat...")
             
-            await calls_to_use.play(
+            await calls_to_use.join_group_call(
                 actual_chat_id,
-                MediaStream(
-                    audio_path,
-                    audio_parameters=AudioQuality.HIGH
-                )
+                AudioPiped(audio_path),
+                stream_type=StreamType().pulse_stream
             )
             
             await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!")
             state.step = None
             
-        except NoActiveGroupCall:
-            await processing_msg.edit_text("❌ **No Active Voice Chat!**\n\nPlease start a voice chat in the group first, then try again.")
-            state.step = None
-        except AlreadyJoinedError:
-            await processing_msg.edit_text("❌ Already playing in this group! Please wait for current audio to finish.")
-            state.step = None
         except Exception as e:
-            error_msg = str(e)
-            await processing_msg.edit_text(f"❌ Error playing audio: {error_msg}")
-            await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
-            state.step = None
+            # Try alternative method
+            try:
+                await calls_to_use.play(
+                    actual_chat_id,
+                    audio_path
+                )
+                await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!")
+                state.step = None
+            except Exception as e2:
+                error_msg = str(e2)
+                if "No active group call" in error_msg or "GROUP_CALL_INVALID" in error_msg:
+                    await processing_msg.edit_text("❌ **No Active Voice Chat!**\n\nPlease start a voice chat in the group first, then try again.")
+                elif "Already joined" in error_msg:
+                    await processing_msg.edit_text("❌ Already playing in this group! Please wait for current audio to finish.")
+                else:
+                    await processing_msg.edit_text(f"❌ Error playing audio: {error_msg}")
+                    await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
+                state.step = None
         finally:
             # Cleanup after delay
             asyncio.create_task(cleanup_file(audio_path))
@@ -558,6 +571,14 @@ async def cleanup_file(file_path):
             logger.info(f"Cleaned up: {file_path}")
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
+
+# Import StreamType for compatibility
+try:
+    from pytgcalls.types.stream import StreamType
+except ImportError:
+    class StreamType:
+        def pulse_stream(self):
+            return 0
 
 # Run bot
 if __name__ == "__main__":
