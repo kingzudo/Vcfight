@@ -11,6 +11,7 @@ from pyrogram.errors import (
 )
 from pytgcalls import PyTgCalls, StreamType
 from pytgcalls.types.input_stream import AudioPiped
+from pytgcalls.exceptions import NoActiveGroupCall, GroupCallNotFound, AlreadyJoinedError
 import yt_dlp
 import logging
 from pathlib import Path
@@ -51,7 +52,7 @@ default_calls = None
 user_calls = {}
 active_streams = {}
 sudo_users = set()
-chat_id_cache = {}  # Permanent cache for chat IDs
+chat_id_cache = {}
 
 # Files
 SUDO_FILE = "/app/data/sudo_users.json"
@@ -147,10 +148,7 @@ def extract_chat_info(text):
     return None
 
 async def find_chat_in_dialogs_advanced(client, invite_hash=None, username=None):
-    """
-    Advanced method to find chat in dialogs
-    Works for both private groups (invite_hash) and public groups (username)
-    """
+    """Advanced method to find chat in dialogs"""
     try:
         logger.info(f"🔍 Searching in dialogs for invite_hash={invite_hash}, username={username}")
         
@@ -160,17 +158,14 @@ async def find_chat_in_dialogs_advanced(client, invite_hash=None, username=None)
                 
                 # For invite hash (private groups)
                 if invite_hash:
-                    # Try to get full chat info
                     try:
                         full_chat = await client.get_chat(chat.id)
                         
-                        # Check invite link
                         if hasattr(full_chat, 'invite_link') and full_chat.invite_link:
                             if invite_hash in full_chat.invite_link:
                                 logger.info(f"✅ Found via invite_link: {chat.id} - {chat.title}")
                                 return chat.id, chat.title
                         
-                        # Check exported invite links (for private groups)
                         try:
                             invite_links = await client.get_chat_invite_link(chat.id)
                             if hasattr(invite_links, 'invite_link') and invite_hash in invite_links.invite_link:
@@ -180,7 +175,6 @@ async def find_chat_in_dialogs_advanced(client, invite_hash=None, username=None)
                             pass
                             
                     except Exception as e:
-                        # If can't get full info, just check basic chat
                         if hasattr(chat, 'invite_link') and chat.invite_link:
                             if invite_hash in chat.invite_link:
                                 logger.info(f"✅ Found via basic check: {chat.id} - {chat.title}")
@@ -206,18 +200,10 @@ async def find_chat_in_dialogs_advanced(client, invite_hash=None, username=None)
 
 async def get_chat_id_smart(client, chat_info, user_key):
     """
-    SUPER SMART METHOD - 10000% Fix
+    ULTIMATE SMART METHOD - Gets chat_id for both public and private groups
+    Now also requests chat_id for private groups if needed
     
-    This method will ALWAYS find the chat_id, no matter what!
-    
-    Strategy:
-    1. Check cache first (fastest)
-    2. Try direct get_chat (for public groups)
-    3. Try join_chat (works even if already member for some cases)
-    4. Deep search in dialogs with multiple checks
-    5. Try get_chat with -100 prefix variations
-    
-    Returns: (success: bool, chat_id, chat_title, error_msg)
+    Returns: (success: bool, chat_id, chat_title, error_msg, needs_chat_id: bool)
     """
     
     try:
@@ -225,23 +211,23 @@ async def get_chat_id_smart(client, chat_info, user_key):
             username = chat_info["value"]
             cache_key = f"{user_key}_user_{username}"
             
-            # ✅ Step 1: Check cache
+            # Step 1: Check cache
             if cache_key in chat_id_cache:
                 cached_id, cached_title = chat_id_cache[cache_key]
                 logger.info(f"✅ CACHE HIT for @{username}: {cached_id}")
-                return True, cached_id, cached_title, None
+                return True, cached_id, cached_title, None, False
             
-            # ✅ Step 2: Try direct get_chat (works for public groups even if member)
+            # Step 2: Try direct get_chat
             try:
                 chat = await client.get_chat(username)
                 chat_id_cache[cache_key] = (chat.id, chat.title)
                 save_chat_cache()
                 logger.info(f"✅ DIRECT GET_CHAT for @{username}: {chat.id}")
-                return True, chat.id, chat.title, None
+                return True, chat.id, chat.title, None, False
             except Exception as e:
                 logger.debug(f"get_chat failed for @{username}: {e}")
             
-            # ✅ Step 3: Try join (silent fail if already member)
+            # Step 3: Try join
             try:
                 await client.join_chat(username)
                 logger.info(f"✅ Joined @{username}")
@@ -250,122 +236,156 @@ async def get_chat_id_smart(client, chat_info, user_key):
             except Exception as join_err:
                 logger.debug(f"Join error for @{username}: {join_err}")
             
-            # ✅ Step 4: Try get_chat again after join attempt
+            # Step 4: Try get_chat again
             try:
                 chat = await client.get_chat(username)
                 chat_id_cache[cache_key] = (chat.id, chat.title)
                 save_chat_cache()
                 logger.info(f"✅ GET_CHAT after join for @{username}: {chat.id}")
-                return True, chat.id, chat.title, None
+                return True, chat.id, chat.title, None, False
             except Exception as e:
                 logger.debug(f"get_chat after join failed: {e}")
             
-            # ✅ Step 5: Search in dialogs
+            # Step 5: Search in dialogs
             chat_id, chat_title = await find_chat_in_dialogs_advanced(client, username=username)
             if chat_id:
                 chat_id_cache[cache_key] = (chat_id, chat_title)
                 save_chat_cache()
                 logger.info(f"✅ DIALOGS SEARCH for @{username}: {chat_id}")
-                return True, chat_id, chat_title, None
+                return True, chat_id, chat_title, None, False
             
-            # If all failed
-            return False, None, None, f"❌ Cannot find group @{username}. Make sure the username is correct."
+            return False, None, None, f"❌ Cannot find group @{username}. Make sure the username is correct.", False
         
         else:  # invite link (private group)
             invite_hash = chat_info.get("hash", "")
             cache_key = f"{user_key}_inv_{invite_hash}"
             
-            # ✅ Step 1: Check cache
+            # Step 1: Check cache
             if cache_key in chat_id_cache:
                 cached_id, cached_title = chat_id_cache[cache_key]
                 logger.info(f"✅ CACHE HIT for invite: {cached_id}")
-                return True, cached_id, cached_title, None
+                return True, cached_id, cached_title, None, False
             
-            # ✅ Step 2: Try join_chat (will fail gracefully if already member)
+            # Step 2: Try join_chat
             try:
                 chat = await client.join_chat(chat_info["value"])
                 chat_id_cache[cache_key] = (chat.id, chat.title)
                 save_chat_cache()
                 logger.info(f"✅ JOINED via invite: {chat.id} - {chat.title}")
-                return True, chat.id, chat.title, None
+                return True, chat.id, chat.title, None, False
             
             except UserAlreadyParticipant:
                 logger.info(f"✅ Already member, searching in dialogs...")
                 
-                # ✅ Step 3: Deep search in dialogs
+                # Step 3: Deep search in dialogs
                 chat_id, chat_title = await find_chat_in_dialogs_advanced(client, invite_hash=invite_hash)
                 
                 if chat_id:
                     chat_id_cache[cache_key] = (chat_id, chat_title)
                     save_chat_cache()
                     logger.info(f"✅ DIALOGS SEARCH found: {chat_id} - {chat_title}")
-                    return True, chat_id, chat_title, None
+                    return True, chat_id, chat_title, None, False
                 
-                # ✅ Step 4: Last resort - iterate ALL chats and try different methods
-                logger.info("🔍 DEEP SCAN: Checking all chats...")
-                try:
-                    async for dialog in client.get_dialogs():
-                        try:
-                            chat = dialog.chat
-                            
-                            # Method 1: Check if it's a group/supergroup
-                            if chat.type in ["group", "supergroup"]:
-                                # Try to get invite link
-                                try:
-                                    invite_link = await client.export_chat_invite_link(chat.id)
-                                    if invite_hash in invite_link:
-                                        chat_id_cache[cache_key] = (chat.id, chat.title)
-                                        save_chat_cache()
-                                        logger.info(f"✅ DEEP SCAN found: {chat.id} - {chat.title}")
-                                        return True, chat.id, chat.title, None
-                                except:
-                                    pass
-                        except:
-                            continue
-                            
-                except Exception as deep_err:
-                    logger.error(f"Deep scan error: {deep_err}")
-                
-                # Absolute last resort - ask user to send message
-                return False, None, None, (
-                    "⚠️ **You're already in this group but I can't locate it automatically.**\n\n"
-                    "**Quick Fix (takes 5 seconds):**\n"
-                    "1. Open the private group in Telegram\n"
-                    "2. Send ANY message (even a dot '.' will work)\n"
-                    "3. Come back here and try again\n\n"
-                    "After sending a message, the group will appear in your recent chats and I'll find it! 🚀"
+                # Step 4: Request chat_id from user
+                error_msg = (
+                    "⚠️ **Cannot find the private group automatically.**\n\n"
+                    "**Please send the Chat ID:**\n\n"
+                    "**How to get Chat ID:**\n"
+                    "1. Forward any message from the group to @username_to_id_bot\n"
+                    "2. The bot will reply with the Chat ID\n"
+                    "3. Send me that Chat ID (it will look like `-100123456789`)\n\n"
+                    "Or you can send a message in the group and try again."
                 )
+                return False, None, None, error_msg, True  # needs_chat_id = True
             
             except InviteHashExpired:
-                return False, None, None, "❌ Invite link expired! Get a new invite link from group admin."
+                return False, None, None, "❌ Invite link expired! Get a new invite link from group admin.", False
             
             except Exception as e:
                 error_str = str(e).upper()
                 
                 if "INVITE_HASH_EXPIRED" in error_str or "EXPIRED" in error_str:
-                    return False, None, None, "❌ Invite link expired! Get a new invite link."
+                    return False, None, None, "❌ Invite link expired! Get a new invite link.", False
                     
                 elif "USER_ALREADY_PARTICIPANT" in error_str:
-                    # Retry with dialogs
                     chat_id, chat_title = await find_chat_in_dialogs_advanced(client, invite_hash=invite_hash)
                     if chat_id:
                         chat_id_cache[cache_key] = (chat_id, chat_title)
                         save_chat_cache()
-                        return True, chat_id, chat_title, None
+                        return True, chat_id, chat_title, None, False
                     
-                    return False, None, None, (
-                        "⚠️ **You're already in this group but I can't locate it.**\n\n"
-                        "**Please:**\n"
-                        "1. Open the group and send a message\n"
-                        "2. Try again\n\n"
-                        "Or provide the group's public username if available."
+                    error_msg = (
+                        "⚠️ **Cannot find the private group automatically.**\n\n"
+                        "**Please send the Chat ID** (like `-100123456789`)\n\n"
+                        "Get it from @username_to_id_bot by forwarding a group message."
                     )
+                    return False, None, None, error_msg, True
                 else:
-                    return False, None, None, f"❌ Error: {str(e)}"
+                    return False, None, None, f"❌ Error: {str(e)}", False
     
     except Exception as e:
         logger.error(f"get_chat_id_smart error: {e}")
-        return False, None, None, f"❌ Unexpected error: {str(e)}"
+        return False, None, None, f"❌ Unexpected error: {str(e)}", False
+
+async def rejoin_and_play(client, calls, chat_id, audio_path, stream_key):
+    """
+    Emergency function: Leave and rejoin group to fix VC issues
+    Only called when normal join fails
+    """
+    try:
+        logger.info(f"🔄 Attempting rejoin strategy for chat {chat_id}")
+        
+        # Step 1: Try to leave current call (if any)
+        try:
+            await calls.leave_group_call(chat_id)
+            await asyncio.sleep(2)
+            logger.info("✅ Left previous call")
+        except:
+            pass
+        
+        # Step 2: Leave the group
+        try:
+            await client.leave_chat(chat_id)
+            await asyncio.sleep(3)
+            logger.info("✅ Left group")
+        except Exception as e:
+            logger.error(f"Failed to leave group: {e}")
+            return False, f"Cannot leave group: {str(e)}"
+        
+        # Step 3: Rejoin the group
+        try:
+            # Get the chat info to rejoin
+            chat = await client.get_chat(chat_id)
+            
+            if hasattr(chat, 'username') and chat.username:
+                await client.join_chat(chat.username)
+            else:
+                # For private groups, we need invite link
+                return False, "Cannot rejoin private group automatically. Please send invite link again."
+            
+            await asyncio.sleep(2)
+            logger.info("✅ Rejoined group")
+        except Exception as e:
+            logger.error(f"Failed to rejoin: {e}")
+            return False, f"Cannot rejoin group: {str(e)}"
+        
+        # Step 4: Try to join VC again
+        try:
+            await calls.join_group_call(
+                chat_id,
+                AudioPiped(audio_path),
+                stream_type=StreamType().pulse_stream
+            )
+            active_streams[stream_key] = chat_id
+            logger.info("✅ Successfully joined VC after rejoin!")
+            return True, None
+        except Exception as e:
+            logger.error(f"Failed to join VC after rejoin: {e}")
+            return False, f"Still cannot join VC: {str(e)}"
+    
+    except Exception as e:
+        logger.error(f"Rejoin strategy failed: {e}")
+        return False, f"Rejoin failed: {str(e)}"
 
 async def download_youtube_audio(url):
     try:
@@ -446,7 +466,6 @@ async def start_command(client, message: Message):
             )
             return
         
-        # Auto-load session if exists
         session_loaded = await check_and_load_session(user_id)
         
         if user_id in user_accounts or session_loaded:
@@ -760,6 +779,7 @@ async def message_handler(client, message: Message):
         return
 
     try:
+        # Phone/OTP/2FA handlers (same as before)
         if state.step == "default_phone":
             phone = text.strip().replace(" ", "")
             state.data["phone"] = phone
@@ -930,6 +950,34 @@ async def message_handler(client, message: Message):
                 await send_error_to_owner(f"Custom 2FA error: {str(e)}")
                 state.step = None
 
+        # NEW: Handle Chat ID input (for private groups)
+        elif state.step == "waiting_chat_id":
+            chat_id_input = text.strip()
+            
+            # Try to parse as chat_id
+            try:
+                actual_chat_id = int(chat_id_input)
+                
+                # Store in state
+                state.data["actual_chat_id"] = actual_chat_id
+                state.step = "audio_input"
+                
+                await message.reply_text(
+                    f"✅ **Chat ID received:** `{actual_chat_id}`\n\n"
+                    "🎵 **Send Audio**\n\n"
+                    "You can send:\n"
+                    "• Audio file 🎵\n"
+                    "• Voice message 🎤\n"
+                    "• YouTube URL 📺"
+                )
+            except ValueError:
+                await message.reply_text(
+                    "❌ Invalid Chat ID format!\n\n"
+                    "Please send a valid Chat ID like: `-100123456789`"
+                )
+            return
+
+        # Group input handler
         elif state.step in ["default_group", "custom_group"]:
             chat_info = extract_chat_info(text)
             
@@ -944,14 +992,60 @@ async def message_handler(client, message: Message):
                 return
             
             state.data["chat_info"] = chat_info
-            state.step = "audio_input"
-            await message.reply_text(
-                "🎵 **Send Audio**\n\n"
-                "You can send:\n"
-                "• Audio file 🎵\n"
-                "• Voice message 🎤\n"
-                "• YouTube URL 📺"
-            )
+            
+            # NEW: For private groups, ask for chat_id immediately
+            if chat_info["type"] == "invite":
+                mode = state.data.get("mode")
+                
+                if mode == "default":
+                    client_to_use = default_account
+                    stream_key = "default"
+                else:
+                    client_to_use = user_accounts.get(user_id)
+                    stream_key = user_id
+                
+                if not client_to_use:
+                    await message.reply_text("❌ Session expired! Please start again with /start")
+                    state.step = None
+                    return
+                
+                # Try smart method first
+                processing_msg = await message.reply_text("⏳ Checking group access...")
+                success, actual_chat_id, chat_title, error_msg, needs_chat_id = await get_chat_id_smart(
+                    client_to_use, chat_info, stream_key
+                )
+                
+                if success and actual_chat_id:
+                    # Success! Store and move to audio input
+                    state.data["actual_chat_id"] = actual_chat_id
+                    state.data["chat_title"] = chat_title
+                    state.step = "audio_input"
+                    await processing_msg.edit_text(
+                        f"✅ **Group Found:** {chat_title}\n\n"
+                        "🎵 **Send Audio**\n\n"
+                        "You can send:\n"
+                        "• Audio file 🎵\n"
+                        "• Voice message 🎤\n"
+                        "• YouTube URL 📺"
+                    )
+                elif needs_chat_id:
+                    # Need chat_id from user
+                    state.step = "waiting_chat_id"
+                    await processing_msg.edit_text(error_msg)
+                else:
+                    # Other error
+                    await processing_msg.edit_text(error_msg)
+                    state.step = None
+            else:
+                # Public group - go directly to audio input
+                state.step = "audio_input"
+                await message.reply_text(
+                    "🎵 **Send Audio**\n\n"
+                    "You can send:\n"
+                    "• Audio file 🎵\n"
+                    "• Voice message 🎤\n"
+                    "• YouTube URL 📺"
+                )
 
         elif state.step == "audio_input":
             mode = state.data.get("mode")
@@ -977,18 +1071,24 @@ async def message_handler(client, message: Message):
 
             processing_msg = await message.reply_text("⏳ Processing...")
 
-            # ✅ SMART METHOD - Get chat_id (10000% fix)
-            await processing_msg.edit_text("⏳ Getting group info...")
-            success, actual_chat_id, chat_title, error_msg = await get_chat_id_smart(
-                client_to_use, chat_info, stream_key
-            )
-            
-            if not success or actual_chat_id is None:
-                await processing_msg.edit_text(error_msg)
-                state.step = None
-                return
+            # Get chat_id (use stored one for private groups with chat_id, or smart method for others)
+            if "actual_chat_id" in state.data:
+                # Already have chat_id (from previous step)
+                actual_chat_id = state.data["actual_chat_id"]
+                chat_title = state.data.get("chat_title", "Group")
+            else:
+                # Get via smart method (for public groups)
+                await processing_msg.edit_text("⏳ Getting group info...")
+                success, actual_chat_id, chat_title, error_msg, needs_chat_id = await get_chat_id_smart(
+                    client_to_use, chat_info, stream_key
+                )
+                
+                if not success or actual_chat_id is None:
+                    await processing_msg.edit_text(error_msg)
+                    state.step = None
+                    return
 
-            await processing_msg.edit_text(f"⏳ Downloading audio from YouTube...")
+            await processing_msg.edit_text("⏳ Downloading audio from YouTube...")
             audio_path = await download_youtube_audio(text)
             
             if not audio_path or not os.path.exists(audio_path):
@@ -1017,16 +1117,35 @@ async def message_handler(client, message: Message):
                 
             except Exception as e:
                 error_msg = str(e)
-                if "No active group call" in error_msg or "GROUP_CALL_INVALID" in error_msg or "not found" in error_msg.lower():
-                    await processing_msg.edit_text(
-                        "❌ **No Active Voice Chat!**\n\n"
-                        "**Please:**\n"
-                        "1. Start a voice chat in the group\n"
-                        "2. Make sure the account is admin or can join voice chat\n"
-                        "3. Try again"
+                
+                # NEW: Try rejoin strategy if normal join fails
+                if any(x in error_msg for x in ["No active group call", "GROUP_CALL_INVALID", "not found", "GROUPCALL_FORBIDDEN"]):
+                    await processing_msg.edit_text("⏳ Trying rejoin strategy...")
+                    
+                    rejoin_success, rejoin_error = await rejoin_and_play(
+                        client_to_use, calls_to_use, actual_chat_id, audio_path, stream_key
                     )
+                    
+                    if rejoin_success:
+                        await processing_msg.edit_text(
+                            f"✅ **Now Playing!** (via rejoin)\n\n"
+                            f"📻 **Group:** {chat_title}\n"
+                            f"🎵 **Audio is playing in voice chat!**\n\n"
+                            f"Use /stop to stop playing."
+                        )
+                        state.step = None
+                    else:
+                        await processing_msg.edit_text(
+                            f"❌ **Rejoin strategy failed:**\n{rejoin_error}\n\n"
+                            f"**Please:**\n"
+                            f"1. Make sure voice chat is active\n"
+                            f"2. Check account permissions\n"
+                            f"3. Try starting a new voice chat"
+                        )
+                        state.step = None
                 elif "Already joined" in error_msg or "GROUPCALL_ALREADY_STARTED" in error_msg:
                     await processing_msg.edit_text("❌ Already playing in this group! Please use /stop first.")
+                    state.step = None
                 else:
                     await processing_msg.edit_text(
                         f"❌ **Error:** {error_msg}\n\n"
@@ -1035,7 +1154,7 @@ async def message_handler(client, message: Message):
                         f"• Account has permission to join"
                     )
                     await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
-                state.step = None
+                    state.step = None
             finally:
                 asyncio.create_task(cleanup_file(audio_path))
 
@@ -1076,16 +1195,20 @@ async def audio_file_handler(client, message: Message):
 
         processing_msg = await message.reply_text("⏳ Processing audio...")
 
-        # ✅ SMART METHOD - Get chat_id (10000% fix)
-        await processing_msg.edit_text("⏳ Getting group info...")
-        success, actual_chat_id, chat_title, error_msg = await get_chat_id_smart(
-            client_to_use, chat_info, stream_key
-        )
-        
-        if not success or actual_chat_id is None:
-            await processing_msg.edit_text(error_msg)
-            state.step = None
-            return
+        # Get chat_id
+        if "actual_chat_id" in state.data:
+            actual_chat_id = state.data["actual_chat_id"]
+            chat_title = state.data.get("chat_title", "Group")
+        else:
+            await processing_msg.edit_text("⏳ Getting group info...")
+            success, actual_chat_id, chat_title, error_msg, needs_chat_id = await get_chat_id_smart(
+                client_to_use, chat_info, stream_key
+            )
+            
+            if not success or actual_chat_id is None:
+                await processing_msg.edit_text(error_msg)
+                state.step = None
+                return
 
         await processing_msg.edit_text("⏳ Downloading audio...")
         audio_path = await message.download(file_name=f"/tmp/downloads/{message.id}.mp3")
@@ -1111,25 +1234,38 @@ async def audio_file_handler(client, message: Message):
             
         except Exception as e:
             error_msg = str(e)
-            if "No active group call" in error_msg or "GROUP_CALL_INVALID" in error_msg or "not found" in error_msg.lower():
-                await processing_msg.edit_text(
-                    "❌ **No Active Voice Chat!**\n\n"
-                    "**Please:**\n"
-                    "1. Start a voice chat in the group\n"
-                    "2. Make sure the account is admin or can join voice chat\n"
-                    "3. Try again"
+            
+            # Try rejoin strategy
+            if any(x in error_msg for x in ["No active group call", "GROUP_CALL_INVALID", "not found", "GROUPCALL_FORBIDDEN"]):
+                await processing_msg.edit_text("⏳ Trying rejoin strategy...")
+                
+                rejoin_success, rejoin_error = await rejoin_and_play(
+                    client_to_use, calls_to_use, actual_chat_id, audio_path, stream_key
                 )
-            elif "Already joined" in error_msg or "GROUPCALL_ALREADY_STARTED" in error_msg:
-                await processing_msg.edit_text("❌ Already playing in this group! Please use /stop first.")
+                
+                if rejoin_success:
+                    await processing_msg.edit_text(
+                        f"✅ **Now Playing!** (via rejoin)\n\n"
+                        f"📻 **Group:** {chat_title}\n"
+                        f"🎵 **Audio is playing in voice chat!**\n\n"
+                        f"Use /stop to stop playing."
+                    )
+                    state.step = None
+                else:
+                    await processing_msg.edit_text(
+                        f"❌ **Rejoin strategy failed:**\n{rejoin_error}\n\n"
+                        f"**Please:**\n"
+                        f"1. Make sure voice chat is active\n"
+                        f"2. Check account permissions"
+                    )
+                    state.step = None
+            elif "Already joined" in error_msg:
+                await processing_msg.edit_text("❌ Already playing! Use /stop first.")
+                state.step = None
             else:
-                await processing_msg.edit_text(
-                    f"❌ **Error:** {error_msg}\n\n"
-                    f"**Make sure:**\n"
-                    f"• Voice chat is active\n"
-                    f"• Account has permission to join"
-                )
-                await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
-            state.step = None
+                await processing_msg.edit_text(f"❌ **Error:** {error_msg}")
+                await send_error_to_owner(f"Audio play error: {error_msg}")
+                state.step = None
         finally:
             asyncio.create_task(cleanup_file(audio_path))
 
@@ -1153,11 +1289,12 @@ if __name__ == "__main__":
         logger.info("🚀 Starting VC Fighting Bot...")
         logger.info(f"Owner ID: {OWNER_ID}")
         logger.info(f"API ID: {API_ID}")
-        logger.info("✅ 10000% FIXED VERSION - Private Groups Work Perfectly!")
+        logger.info("✅ ULTRA FIXED VERSION - All Group Types Supported!")
+        logger.info("🔥 NEW: Chat ID Request for Private Groups")
+        logger.info("🔥 NEW: Emergency Rejoin Strategy")
         logger.info("Powered by @zudo_userbot")
         bot.run()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
-
