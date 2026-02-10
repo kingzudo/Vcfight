@@ -1,211 +1,25 @@
-# Telegram VC Fighting Bot 🎵
+version: '3.8'
 
-Complete working Telegram Voice Chat bot with no errors!
-
-## ✨ Features
-
-- 🔵 **Default Account Mode** - Owner configures, anyone can use
-- 🟢 **Custom Account Mode** - Login with your own account  
-- 🎵 **Multi-format Support** - Audio files, Voice messages, YouTube URLs
-- 🔐 **Full 2FA Support** - Complete authentication handling
-- 📊 **Error Reporting** - All errors sent to owner via DM
-- 🧹 **Auto Cleanup** - Automatic file management
-
-## 🚀 Quick Start
-
-### Docker Deployment (Recommended)
-
-```bash
-# Build image
-docker build -t vc-bot .
-
-# Run container
-docker run -d \
-  --name vc-fighting-bot \
-  --restart unless-stopped \
-  vc-bot
-
-# View logs
-docker logs -f vc-fighting-bot
-
-# Stop bot
-docker stop vc-fighting-bot
-
-# Restart bot
-docker restart vc-fighting-bot
-```
-
-### Manual Deployment
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Install FFmpeg
-sudo apt-get update
-sudo apt-get install -y ffmpeg
-
-# Run bot
-python bot.py
-```
-
-## 📱 How to Use
-
-### For Owner (Setup Default Account)
-
-1. Send `/setdefault` to bot
-2. Enter phone number (with country code)
-3. Enter OTP code
-4. If 2FA enabled, enter password
-5. Done! Default account is ready
-
-### For Users (Default Account)
-
-1. Send `/start`
-2. Click **Default Account** button
-3. Send group link (e.g., `https://t.me/yourgroup`)
-4. Send audio file, voice message, or YouTube URL
-5. Bot will play in voice chat!
-
-### For Users (Own Account)
-
-1. Send `/start`
-2. Click **Login My Account** button
-3. Enter your phone number
-4. Enter OTP code
-5. If 2FA enabled, enter password
-6. Send group link
-7. Send audio file or YouTube URL
-8. Bot will play using your account!
-
-### Logout
-
-Send `/logout` to logout from your custom account
-
-## 🔧 Configuration
-
-All settings are pre-configured in `bot.py`:
-
-```python
-OWNER_ID = 7661825494
-BOT_TOKEN = "7845373810:AAH5jWEJhLoObAwFXxjK6KFpwGZ2Y1N2fE0"
-API_ID = 33628258
-API_HASH = "0850762925b9c1715b9b122f7b753128"
-```
-
-## 📋 Requirements
-
-- Python 3.9+
-- FFmpeg
-- Stable internet connection
-- Docker (optional but recommended)
-
-## 🛡️ Error Handling
-
-- All runtime errors are caught and handled
-- Owner receives DM notifications for critical errors
-- User-friendly error messages
-- Automatic session recovery
-- File cleanup to prevent storage issues
-
-## 📝 Important Notes
-
-1. **Voice Chat Must Be Active** - Start voice chat in the group before playing audio
-2. **Bot Must Be Admin** - Add bot to group and make it admin (optional but recommended)
-3. **Account Must Join Group** - The account (default or custom) must be able to join the target group
-4. **One Audio Per Group** - Can't play multiple audios simultaneously in the same group
-
-## 🐛 Troubleshooting
-
-### "No Active Voice Chat" Error
-- Start a voice chat in the group first
-- Then send audio to the bot
-
-### "Cannot Access Group" Error
-- Make sure the group link is correct
-- Ensure the account can join the group (not banned)
-- Check if group is public or you have invite link
-
-### "Already Playing" Error
-- Wait for current audio to finish
-- Or leave and rejoin voice chat in the group
-
-### Bot Not Responding
-- Check if bot is running: `docker logs vc-fighting-bot`
-- Restart bot: `docker restart vc-fighting-bot`
-- Check owner DMs for error reports
-
-## 🔄 Updates & Maintenance
-
-### View Logs
-```bash
-docker logs -f vc-fighting-bot
-```
-
-### Restart Bot
-```bash
-docker restart vc-fighting-bot
-```
-
-### Update Bot
-```bash
-# Stop and remove old container
-docker stop vc-fighting-bot
-docker rm vc-fighting-bot
-
-# Rebuild with new code
-docker build -t vc-bot .
-
-# Run new container
-docker run -d --name vc-fighting-bot --restart unless-stopped vc-bot
-```
-
-## 📦 Project Structure
-
-```
-telegram_vc_bot/
-├── bot.py              # Main bot script
-├── requirements.txt    # Python dependencies
-├── Dockerfile         # Docker configuration
-└── README.md          # This file
-```
-
-## 🎯 Tested & Working
-
-✅ Phone authentication  
-✅ OTP verification  
-✅ 2FA password support  
-✅ Default account mode  
-✅ Custom account mode  
-✅ YouTube audio download  
-✅ Audio file playback  
-✅ Voice message playback  
-✅ Error handling & reporting  
-✅ Session management  
-✅ Group joining  
-✅ Voice chat integration  
-
-## 💡 Tips
-
-- Use Docker for stable deployment
-- Make sure voice chat is started in group before playing
-- For YouTube, use direct video URLs (not playlists)
-- Default account is shared - custom account is private
-- Keep bot token and API credentials secure
-
-## 🆘 Support
-
-If you encounter any issues:
-1. Check bot logs
-2. Check owner DMs for error reports
-3. Verify all requirements are installed
-4. Make sure FFmpeg is installed
-5. Check internet connection
-
-## ⚖️ License
-
-Free to use and modify for personal projects.
-
----
-
-**Made with ❤️ for Telegram Voice Chat Fighting**
+services:
+  vc_bot:
+    build: .
+    container_name: vc_fighting_bot
+    restart: unless-stopped
+    volumes:
+      - ./sessions:/app/sessions
+      - ./downloads:/tmp/downloads
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
