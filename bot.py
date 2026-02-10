@@ -4,10 +4,8 @@ import re
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid, PasswordHashInvalid, FloodWait
-from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped, Stream, StreamAudioEnded
-from pytgcalls.types.input_stream import AudioParameters, AudioVideoPiped
-from pytgcalls.types.input_stream.quality import HighQualityAudio
+from pytgcalls import PyTgCalls, StreamType
+from pytgcalls.types.input_stream import AudioPiped
 import yt_dlp
 import logging
 from pathlib import Path
@@ -474,11 +472,11 @@ async def message_handler(client, message: Message):
             try:
                 await processing_msg.edit_text("⏳ Joining voice chat...")
                 
-                # Join voice chat and play with new API
+                # Join voice chat and play with correct API
                 await calls_to_use.join_group_call(
                     actual_chat_id,
                     AudioPiped(audio_path),
-                    stream_type=StreamAudioEnded.LOCAL_STREAM
+                    stream_type=StreamType().pulse_stream
                 )
                 
                 active_streams[stream_key] = actual_chat_id
@@ -561,11 +559,11 @@ async def audio_file_handler(client, message: Message):
         try:
             await processing_msg.edit_text("⏳ Joining voice chat...")
             
-            # Join voice chat and play with new API
+            # Join voice chat and play with correct API
             await calls_to_use.join_group_call(
                 actual_chat_id,
                 AudioPiped(audio_path),
-                stream_type=StreamAudioEnded.LOCAL_STREAM
+                stream_type=StreamType().pulse_stream
             )
             
             active_streams[stream_key] = actual_chat_id
