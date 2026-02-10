@@ -4,7 +4,10 @@ import re
 import json
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid, PasswordHashInvalid, FloodWait
+from pyrogram.errors import (
+    SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid, 
+    PasswordHashInvalid, FloodWait, UserAlreadyParticipant, InviteHashExpired
+)
 from pytgcalls import PyTgCalls, StreamType
 from pytgcalls.types.input_stream import AudioPiped
 import yt_dlp
@@ -119,6 +122,55 @@ def extract_chat_info(text):
         return {"type": "username", "value": text.replace('@', '')}
     
     return None
+
+async def join_chat_safely(client, chat_info):
+    """
+    Safely join a chat, handling already joined scenarios
+    Returns: (success: bool, chat_id, error_msg)
+    """
+    try:
+        if chat_info["type"] == "username":
+            # For public groups/channels
+            try:
+                # Try to join first
+                await client.join_chat(chat_info["value"])
+                logger.info(f"Successfully joined: {chat_info['value']}")
+            except UserAlreadyParticipant:
+                # Already in the group, this is fine
+                logger.info(f"Already participant in: {chat_info['value']}")
+                pass
+            except Exception as join_error:
+                # Log but don't fail - we'll try to get chat anyway
+                logger.info(f"Join attempt: {join_error}")
+            
+            # Get chat details
+            chat = await client.get_chat(chat_info["value"])
+            return True, chat.id, None
+            
+        else:  # invite link
+            try:
+                # Try to join via invite link
+                chat = await client.join_chat(chat_info["value"])
+                logger.info(f"Successfully joined via invite: {chat_info['value']}")
+                return True, chat.id, None
+            except UserAlreadyParticipant:
+                # Already in group, but we need chat_id
+                # For private groups, we can't get chat without being member
+                # So this shouldn't happen, but log it
+                logger.info(f"Already participant via invite: {chat_info['value']}")
+                # Try to extract chat_id from error or return None
+                return False, None, "Already in group but cannot get chat ID from invite link. Please use public username or send group message to bot."
+            except InviteHashExpired:
+                return False, None, "❌ Invite link expired! Please get a new invite link."
+            except Exception as e:
+                error_msg = str(e)
+                if "USER_ALREADY_PARTICIPANT" in error_msg:
+                    return False, None, "Already in group but cannot access via invite link. Please use group username if available."
+                return False, None, f"Cannot join via invite: {error_msg}"
+    
+    except Exception as e:
+        logger.error(f"Join chat error: {e}")
+        return False, None, str(e)
 
 async def download_youtube_audio(url):
     try:
@@ -731,34 +783,21 @@ async def message_handler(client, message: Message):
 
             processing_msg = await message.reply_text("⏳ Processing...")
 
+            # Join group safely
+            await processing_msg.edit_text("⏳ Joining group...")
+            success, actual_chat_id, error_msg = await join_chat_safely(client_to_use, chat_info)
+            
+            if not success or actual_chat_id is None:
+                await processing_msg.edit_text(f"❌ {error_msg}")
+                state.step = None
+                return
+            
+            # Get chat details for display
             try:
-                await processing_msg.edit_text("⏳ Joining group...")
-                
-                # Join based on type
-                if chat_info["type"] == "username":
-                    await client_to_use.join_chat(chat_info["value"])
-                    chat = await client_to_use.get_chat(chat_info["value"])
-                else:  # invite link
-                    chat = await client_to_use.join_chat(chat_info["value"])
-                
-                actual_chat_id = chat.id
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.info(f"Join chat: {e}")
-                # Try to get chat anyway
-                try:
-                    if chat_info["type"] == "username":
-                        chat = await client_to_use.get_chat(chat_info["value"])
-                        actual_chat_id = chat.id
-                    else:
-                        await processing_msg.edit_text(f"❌ Cannot join private group: {str(e)}")
-                        state.step = None
-                        return
-                except Exception as e2:
-                    await processing_msg.edit_text(f"❌ Cannot access group: {str(e2)}")
-                    await send_error_to_owner(f"Chat access error: {str(e2)}")
-                    state.step = None
-                    return
+                chat = await client_to_use.get_chat(actual_chat_id)
+                chat_title = chat.title
+            except:
+                chat_title = "Unknown"
 
             await processing_msg.edit_text(f"⏳ Downloading audio from YouTube...")
             audio_path = await download_youtube_audio(text)
@@ -781,7 +820,7 @@ async def message_handler(client, message: Message):
                 
                 await processing_msg.edit_text(
                     f"✅ **Now Playing!**\n\n"
-                    f"📻 Group: {chat.title}\n"
+                    f"📻 Group: {chat_title}\n"
                     f"🎵 Audio is playing in voice chat!\n\n"
                     f"Use /stop to stop playing."
                 )
@@ -848,33 +887,21 @@ async def audio_file_handler(client, message: Message):
 
         processing_msg = await message.reply_text("⏳ Processing audio...")
 
+        # Join group safely
+        await processing_msg.edit_text("⏳ Joining group...")
+        success, actual_chat_id, error_msg = await join_chat_safely(client_to_use, chat_info)
+        
+        if not success or actual_chat_id is None:
+            await processing_msg.edit_text(f"❌ {error_msg}")
+            state.step = None
+            return
+        
+        # Get chat details for display
         try:
-            await processing_msg.edit_text("⏳ Joining group...")
-            
-            # Join based on type
-            if chat_info["type"] == "username":
-                await client_to_use.join_chat(chat_info["value"])
-                chat = await client_to_use.get_chat(chat_info["value"])
-            else:  # invite link
-                chat = await client_to_use.join_chat(chat_info["value"])
-            
-            actual_chat_id = chat.id
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.info(f"Join chat: {e}")
-            try:
-                if chat_info["type"] == "username":
-                    chat = await client_to_use.get_chat(chat_info["value"])
-                    actual_chat_id = chat.id
-                else:
-                    await processing_msg.edit_text(f"❌ Cannot join private group: {str(e)}")
-                    state.step = None
-                    return
-            except Exception as e2:
-                await processing_msg.edit_text(f"❌ Cannot access group: {str(e2)}")
-                await send_error_to_owner(f"Chat access error: {str(e2)}")
-                state.step = None
-                return
+            chat = await client_to_use.get_chat(actual_chat_id)
+            chat_title = chat.title
+        except:
+            chat_title = "Unknown"
 
         await processing_msg.edit_text("⏳ Downloading audio...")
         audio_path = await message.download(file_name=f"/tmp/downloads/{message.id}.mp3")
@@ -892,7 +919,7 @@ async def audio_file_handler(client, message: Message):
             
             await processing_msg.edit_text(
                 f"✅ **Now Playing!**\n\n"
-                f"📻 Group: {chat.title}\n"
+                f"📻 Group: {chat_title}\n"
                 f"🎵 Audio is playing in voice chat!\n\n"
                 f"Use /stop to stop playing."
             )
