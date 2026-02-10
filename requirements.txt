@@ -1,0 +1,6 @@
+pyrogram==2.0.106
+tgcrypto==1.2.5
+py-tgcalls==1.0.0rc2
+yt-dlp==2023.12.30
+aiohttp==3.9.1
+aiofiles==23.2.1
