@@ -6,7 +6,8 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.errors import (
     SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid, 
-    PasswordHashInvalid, FloodWait, UserAlreadyParticipant, InviteHashExpired
+    PasswordHashInvalid, FloodWait, UserAlreadyParticipant, 
+    InviteHashExpired, UserNotParticipant
 )
 from pytgcalls import PyTgCalls, StreamType
 from pytgcalls.types.input_stream import AudioPiped
@@ -50,6 +51,7 @@ default_calls = None
 user_calls = {}
 active_streams = {}
 sudo_users = set()
+chat_id_cache = {}  # Cache for private group chat IDs
 
 # Files
 SUDO_FILE = "/app/data/sudo_users.json"
@@ -95,26 +97,26 @@ def extract_chat_info(text):
     
     # Check if it's an invite link (private group)
     invite_patterns = [
-        r't\.me/\+([a-zA-Z0-9_-]+)',
-        r't\.me/joinchat/([a-zA-Z0-9_-]+)',
+        r'(https?://)?t\.me/\+([a-zA-Z0-9_-]+)',
+        r'(https?://)?t\.me/joinchat/([a-zA-Z0-9_-]+)',
     ]
     
     for pattern in invite_patterns:
         match = re.search(pattern, text)
         if match:
-            return {"type": "invite", "value": match.group(0)}
+            return {"type": "invite", "value": text, "hash": match.group(2)}
     
     # Check if it's a username (public group/channel)
     username_patterns = [
-        r't\.me/([a-zA-Z0-9_]+)',
-        r'telegram\.me/([a-zA-Z0-9_]+)',
+        r'(https?://)?t\.me/([a-zA-Z0-9_]+)',
+        r'(https?://)?telegram\.me/([a-zA-Z0-9_]+)',
         r'@([a-zA-Z0-9_]+)',
     ]
     
     for pattern in username_patterns:
         match = re.search(pattern, text)
         if match:
-            username = match.group(1)
+            username = match.group(2) if 't.me' in pattern or 'telegram' in pattern else match.group(1)
             return {"type": "username", "value": username}
     
     # If no pattern matches, assume it's a username without @
@@ -123,54 +125,99 @@ def extract_chat_info(text):
     
     return None
 
-async def join_chat_safely(client, chat_info):
+async def get_chat_id_from_dialogs(client, invite_hash):
+    """
+    Try to find chat_id from user's dialogs (for private groups)
+    when user is already a participant
+    """
+    try:
+        async for dialog in client.get_dialogs():
+            chat = dialog.chat
+            if chat.invite_link:
+                # Check if this chat's invite link matches
+                if invite_hash in chat.invite_link:
+                    logger.info(f"Found chat via dialogs: {chat.id} - {chat.title}")
+                    return chat.id, chat.title
+        return None, None
+    except Exception as e:
+        logger.error(f"Error searching dialogs: {e}")
+        return None, None
+
+async def join_chat_safely(client, chat_info, user_key):
     """
     Safely join a chat, handling already joined scenarios
-    Returns: (success: bool, chat_id, error_msg)
+    Returns: (success: bool, chat_id, chat_title, error_msg)
     """
     try:
         if chat_info["type"] == "username":
             # For public groups/channels
             try:
-                # Try to join first
                 await client.join_chat(chat_info["value"])
-                logger.info(f"Successfully joined: {chat_info['value']}")
+                logger.info(f"✅ Successfully joined: {chat_info['value']}")
             except UserAlreadyParticipant:
-                # Already in the group, this is fine
-                logger.info(f"Already participant in: {chat_info['value']}")
-                pass
-            except Exception as join_error:
-                # Log but don't fail - we'll try to get chat anyway
-                logger.info(f"Join attempt: {join_error}")
+                logger.info(f"✅ Already participant in: {chat_info['value']}")
+            except Exception as e:
+                logger.info(f"Join attempt: {str(e)}")
             
             # Get chat details
-            chat = await client.get_chat(chat_info["value"])
-            return True, chat.id, None
+            try:
+                chat = await client.get_chat(chat_info["value"])
+                return True, chat.id, chat.title, None
+            except Exception as e:
+                return False, None, None, f"Cannot access group: {str(e)}"
             
-        else:  # invite link
+        else:  # invite link (private group)
+            invite_hash = chat_info.get("hash", "")
+            cache_key = f"{user_key}_{invite_hash}"
+            
+            # Check if we have cached chat_id for this invite
+            if cache_key in chat_id_cache:
+                cached_id, cached_title = chat_id_cache[cache_key]
+                logger.info(f"✅ Using cached chat_id: {cached_id}")
+                return True, cached_id, cached_title, None
+            
             try:
                 # Try to join via invite link
                 chat = await client.join_chat(chat_info["value"])
-                logger.info(f"Successfully joined via invite: {chat_info['value']}")
-                return True, chat.id, None
-            except UserAlreadyParticipant:
-                # Already in group, but we need chat_id
-                # For private groups, we can't get chat without being member
-                # So this shouldn't happen, but log it
-                logger.info(f"Already participant via invite: {chat_info['value']}")
-                # Try to extract chat_id from error or return None
-                return False, None, "Already in group but cannot get chat ID from invite link. Please use public username or send group message to bot."
+                logger.info(f"✅ Successfully joined via invite: {chat.title}")
+                
+                # Cache the chat_id
+                chat_id_cache[cache_key] = (chat.id, chat.title)
+                return True, chat.id, chat.title, None
+                
+            except UserAlreadyParticipant as e:
+                logger.info(f"✅ Already participant, searching in dialogs...")
+                
+                # User is already member, try to find chat_id from dialogs
+                chat_id, chat_title = await get_chat_id_from_dialogs(client, invite_hash)
+                
+                if chat_id:
+                    # Cache the found chat_id
+                    chat_id_cache[cache_key] = (chat_id, chat_title)
+                    return True, chat_id, chat_title, None
+                else:
+                    return False, None, None, "❌ Already in group but couldn't find chat. Please send a message in the group and try again, or use the group's public username if available."
+            
             except InviteHashExpired:
-                return False, None, "❌ Invite link expired! Please get a new invite link."
+                return False, None, None, "❌ Invite link expired! Please get a new invite link."
+            
             except Exception as e:
-                error_msg = str(e)
-                if "USER_ALREADY_PARTICIPANT" in error_msg:
-                    return False, None, "Already in group but cannot access via invite link. Please use group username if available."
-                return False, None, f"Cannot join via invite: {error_msg}"
+                error_str = str(e)
+                if "INVITE_HASH_EXPIRED" in error_str:
+                    return False, None, None, "❌ Invite link expired! Please get a new invite link."
+                elif "USER_ALREADY_PARTICIPANT" in error_str:
+                    # Fallback: search in dialogs
+                    chat_id, chat_title = await get_chat_id_from_dialogs(client, invite_hash)
+                    if chat_id:
+                        chat_id_cache[cache_key] = (chat_id, chat_title)
+                        return True, chat_id, chat_title, None
+                    return False, None, None, "❌ Already in group but couldn't find chat. Send a message in the group first."
+                else:
+                    return False, None, None, f"❌ Cannot join: {error_str}"
     
     except Exception as e:
         logger.error(f"Join chat error: {e}")
-        return False, None, str(e)
+        return False, None, None, str(e)
 
 async def download_youtube_audio(url):
     try:
@@ -785,19 +832,14 @@ async def message_handler(client, message: Message):
 
             # Join group safely
             await processing_msg.edit_text("⏳ Joining group...")
-            success, actual_chat_id, error_msg = await join_chat_safely(client_to_use, chat_info)
+            success, actual_chat_id, chat_title, error_msg = await join_chat_safely(
+                client_to_use, chat_info, stream_key
+            )
             
             if not success or actual_chat_id is None:
-                await processing_msg.edit_text(f"❌ {error_msg}")
+                await processing_msg.edit_text(error_msg)
                 state.step = None
                 return
-            
-            # Get chat details for display
-            try:
-                chat = await client_to_use.get_chat(actual_chat_id)
-                chat_title = chat.title
-            except:
-                chat_title = "Unknown"
 
             await processing_msg.edit_text(f"⏳ Downloading audio from YouTube...")
             audio_path = await download_youtube_audio(text)
@@ -889,19 +931,14 @@ async def audio_file_handler(client, message: Message):
 
         # Join group safely
         await processing_msg.edit_text("⏳ Joining group...")
-        success, actual_chat_id, error_msg = await join_chat_safely(client_to_use, chat_info)
+        success, actual_chat_id, chat_title, error_msg = await join_chat_safely(
+            client_to_use, chat_info, stream_key
+        )
         
         if not success or actual_chat_id is None:
-            await processing_msg.edit_text(f"❌ {error_msg}")
+            await processing_msg.edit_text(error_msg)
             state.step = None
             return
-        
-        # Get chat details for display
-        try:
-            chat = await client_to_use.get_chat(actual_chat_id)
-            chat_title = chat.title
-        except:
-            chat_title = "Unknown"
 
         await processing_msg.edit_text("⏳ Downloading audio...")
         audio_path = await message.download(file_name=f"/tmp/downloads/{message.id}.mp3")
