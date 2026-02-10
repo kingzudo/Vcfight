@@ -198,6 +198,8 @@ async def callback_handler(client, callback_query):
 # Message handler for steps
 @bot.on_message(filters.private & filters.text & ~filters.command(["start", "setdefault", "logout"]))
 async def message_handler(client, message: Message):
+    global default_account, default_calls  # ✅ FIX: Pehle global declare karo
+    
     user_id = message.from_user.id
     state = get_user_state(user_id)
     text = message.text
@@ -246,7 +248,6 @@ async def message_handler(client, message: Message):
                     otp
                 )
                 
-                global default_account, default_calls
                 default_account = user_client
                 default_calls = PyTgCalls(default_account)
                 await default_calls.start()
@@ -272,7 +273,6 @@ async def message_handler(client, message: Message):
                 user_client = state.data["client"]
                 await user_client.check_password(password)
                 
-                global default_account, default_calls
                 default_account = user_client
                 default_calls = PyTgCalls(default_account)
                 await default_calls.start()
