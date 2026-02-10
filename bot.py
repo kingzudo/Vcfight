@@ -4,10 +4,8 @@ import re
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid, PasswordHashInvalid, FloodWait
-from pytgcalls import PyTgCalls, idle
-from pytgcalls.types import AudioPiped
-from pytgcalls.types.input_stream import InputAudioStream, AudioParameters
-from pytgcalls.types.input_stream.quality import HighQualityAudio
+from pytgcalls import PyTgCalls
+from pytgcalls.types import StreamType
 import yt_dlp
 import logging
 from pathlib import Path
@@ -429,14 +427,15 @@ async def message_handler(client, message: Message):
                 state.step = None
                 return
 
-            # Play audio using proper pytgcalls method
+            # Play audio
             try:
                 await processing_msg.edit_text("⏳ Joining voice chat...")
                 
-                # Use the correct method for py-tgcalls
-                await calls_to_use.play(
-                    chat_id=actual_chat_id,
-                    file_path=audio_path
+                # Join voice chat and play
+                await calls_to_use.join_group_call(
+                    actual_chat_id,
+                    audio_path,
+                    stream_type=StreamType().local_stream
                 )
                 
                 await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!")
@@ -511,14 +510,15 @@ async def audio_file_handler(client, message: Message):
         await processing_msg.edit_text("⏳ Downloading audio...")
         audio_path = await message.download(file_name=f"/tmp/downloads/{message.id}.mp3")
 
-        # Play audio using proper pytgcalls method
+        # Play audio
         try:
             await processing_msg.edit_text("⏳ Joining voice chat...")
             
-            # Use the correct method for py-tgcalls
-            await calls_to_use.play(
-                chat_id=actual_chat_id,
-                file_path=audio_path
+            # Join voice chat and play
+            await calls_to_use.join_group_call(
+                actual_chat_id,
+                audio_path,
+                stream_type=StreamType().local_stream
             )
             
             await processing_msg.edit_text(f"✅ **Now Playing!**\n\n📻 Group: {chat.title}\n🎵 Audio is playing in voice chat!")

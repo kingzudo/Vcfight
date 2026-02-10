@@ -1,4 +1,4 @@
-pyrogram
-TgCrypto
-py-tgcalls
-yt-dlp
+pyrogram==2.0.106
+TgCrypto==1.2.5
+py-tgcalls==0.9.7
+yt-dlp==2023.12.30
