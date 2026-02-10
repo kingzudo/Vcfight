@@ -1,6 +1,7 @@
 import os
 import asyncio
 import re
+import json
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid, PasswordHashInvalid, FloodWait
@@ -15,10 +16,12 @@ OWNER_ID = 7661825494
 BOT_TOKEN = "7845373810:AAH5jWEJhLoObAwFXxjK6KFpwGZ2Y1N2fE0"
 API_ID = 33628258
 API_HASH = "0850762925b9c1715b9b122f7b753128"
+YT_API_KEY = "GKFCo80cuD"
 
 # Setup directories
 Path("/tmp/downloads").mkdir(exist_ok=True, parents=True)
 Path("/app/sessions").mkdir(exist_ok=True, parents=True)
+Path("/app/data").mkdir(exist_ok=True, parents=True)
 
 # Logging setup
 logging.basicConfig(
@@ -36,15 +39,39 @@ bot = Client(
     workdir="/app/sessions"
 )
 
-# Storage for user sessions and states
+# Storage
 user_states = {}
 default_account = None
 user_accounts = {}
 default_calls = None
 user_calls = {}
 active_streams = {}
+sudo_users = set()
 
-# User state management
+# Files
+SUDO_FILE = "/app/data/sudo_users.json"
+
+def load_sudo_users():
+    global sudo_users
+    try:
+        if os.path.exists(SUDO_FILE):
+            with open(SUDO_FILE, 'r') as f:
+                sudo_users = set(json.load(f))
+        else:
+            sudo_users = set()
+    except Exception as e:
+        logger.error(f"Error loading sudo users: {e}")
+        sudo_users = set()
+
+def save_sudo_users():
+    try:
+        with open(SUDO_FILE, 'w') as f:
+            json.dump(list(sudo_users), f)
+    except Exception as e:
+        logger.error(f"Error saving sudo users: {e}")
+
+load_sudo_users()
+
 class UserState:
     def __init__(self):
         self.step = None
@@ -55,13 +82,16 @@ def get_user_state(user_id):
         user_states[user_id] = UserState()
     return user_states[user_id]
 
-# Extract group chat ID from link
+def is_authorized(user_id):
+    return user_id == OWNER_ID or user_id in sudo_users
+
 def extract_chat_id(link):
     patterns = [
         r't\.me/([a-zA-Z0-9_]+)',
         r't\.me/joinchat/([a-zA-Z0-9_-]+)',
         r'telegram\.me/([a-zA-Z0-9_]+)',
-        r't\.me/\+([a-zA-Z0-9_-]+)'
+        r't\.me/\+([a-zA-Z0-9_-]+)',
+        r't\.me/c/(\d+)'
     ]
     for pattern in patterns:
         match = re.search(pattern, link)
@@ -69,7 +99,6 @@ def extract_chat_id(link):
             return match.group(1)
     return link.strip()
 
-# Download YouTube audio
 async def download_youtube_audio(url):
     try:
         output_path = f'/tmp/downloads/{int(asyncio.get_event_loop().time())}'
@@ -79,6 +108,7 @@ async def download_youtube_audio(url):
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
+            'nocheckcertificate': True,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
@@ -100,49 +130,178 @@ async def send_error_to_owner(error_msg):
     except:
         pass
 
-# Start command
+async def check_and_load_session(user_id):
+    """Check if user has saved session and auto-load it"""
+    session_file = f"/app/sessions/user_{user_id}.session"
+    if os.path.exists(session_file):
+        try:
+            user_client = Client(
+                f"user_{user_id}",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                workdir="/app/sessions"
+            )
+            await user_client.start()
+            user_accounts[user_id] = user_client
+            user_calls[user_id] = PyTgCalls(user_client)
+            await user_calls[user_id].start()
+            return True
+        except Exception as e:
+            logger.error(f"Auto-load session error: {e}")
+            return False
+    return False
+
 @bot.on_message(filters.command("start") & filters.private)
 async def start_command(client, message: Message):
     try:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔵 Default Account", callback_data="use_default")],
-            [InlineKeyboardButton("🟢 Login My Account", callback_data="use_custom")]
-        ])
-        await message.reply_text(
-            "**🎵 Welcome to VC Fighting Bot!**\n\n"
-            "Choose an option:\n"
-            "• **Default Account**: Use pre-configured account\n"
-            "• **Login My Account**: Use your own account\n\n"
-            "**Owner Commands:**\n"
-            "• /setdefault - Setup default account\n"
-            "• /logout - Logout from your account\n"
-            "• /stop - Stop playing audio",
-            reply_markup=keyboard
-        )
+        user_id = message.from_user.id
+        
+        if not is_authorized(user_id):
+            await message.reply_text(
+                "❌ **Access Denied!**\n\n"
+                "This bot is only available for authorized users.\n"
+                "Contact the owner for access."
+            )
+            return
+        
+        # Auto-load session if exists
+        session_loaded = await check_and_load_session(user_id)
+        
+        if user_id in user_accounts or session_loaded:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎵 Play Audio", callback_data="play_audio")],
+                [InlineKeyboardButton("🚪 Logout", callback_data="logout_account")]
+            ])
+            await message.reply_text(
+                "**🎵 Welcome Back!**\n\n"
+                "You're already logged in! ✅\n\n"
+                "Choose an option:\n\n"
+                "**Powered by** @zudo_userbot",
+                reply_markup=keyboard
+            )
+        else:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔵 Default Account", callback_data="use_default")],
+                [InlineKeyboardButton("🟢 Login My Account", callback_data="use_custom")]
+            ])
+            
+            commands_text = ""
+            if user_id == OWNER_ID:
+                commands_text = "\n\n**Owner Commands:**\n• /setdefault - Setup default account\n• /sudo <username/userid> - Add sudo user\n• /rmsudo <username/userid> - Remove sudo user\n• /sudolist - List all sudo users"
+            
+            await message.reply_text(
+                "**🎵 Welcome to VC Fighting Bot!**\n\n"
+                "Choose an option:\n"
+                "• **Default Account**: Use pre-configured account\n"
+                "• **Login My Account**: Use your own account\n\n"
+                "**Commands:**\n"
+                "• /logout - Logout from your account\n"
+                "• /stop - Stop playing audio"
+                f"{commands_text}\n\n"
+                "**Powered by** @zudo_userbot",
+                reply_markup=keyboard
+            )
     except Exception as e:
         logger.error(f"Start command error: {e}")
         await send_error_to_owner(f"Start command error: {str(e)}")
 
-# Set default account (Owner only)
+@bot.on_message(filters.command("sudo") & filters.private & filters.user(OWNER_ID))
+async def add_sudo(client, message: Message):
+    try:
+        if len(message.command) < 2:
+            await message.reply_text("❌ **Usage:** `/sudo <username or userid>`\n\n**Example:** `/sudo @username` or `/sudo 123456789`")
+            return
+        
+        user_input = message.command[1]
+        
+        try:
+            if user_input.startswith('@'):
+                user = await client.get_users(user_input[1:])
+            else:
+                user = await client.get_users(int(user_input))
+            
+            if user.id in sudo_users:
+                await message.reply_text(f"ℹ️ **{user.first_name}** is already a sudo user!")
+            else:
+                sudo_users.add(user.id)
+                save_sudo_users()
+                await message.reply_text(f"✅ **{user.first_name}** (`{user.id}`) added as sudo user!")
+        except Exception as e:
+            await message.reply_text(f"❌ User not found: {str(e)}")
+    except Exception as e:
+        logger.error(f"Add sudo error: {e}")
+        await message.reply_text(f"❌ Error: {str(e)}")
+
+@bot.on_message(filters.command("rmsudo") & filters.private & filters.user(OWNER_ID))
+async def remove_sudo(client, message: Message):
+    try:
+        if len(message.command) < 2:
+            await message.reply_text("❌ **Usage:** `/rmsudo <username or userid>`\n\n**Example:** `/rmsudo @username` or `/rmsudo 123456789`")
+            return
+        
+        user_input = message.command[1]
+        
+        try:
+            if user_input.startswith('@'):
+                user = await client.get_users(user_input[1:])
+            else:
+                user = await client.get_users(int(user_input))
+            
+            if user.id not in sudo_users:
+                await message.reply_text(f"ℹ️ **{user.first_name}** is not a sudo user!")
+            else:
+                sudo_users.remove(user.id)
+                save_sudo_users()
+                await message.reply_text(f"✅ **{user.first_name}** (`{user.id}`) removed from sudo users!")
+        except Exception as e:
+            await message.reply_text(f"❌ User not found: {str(e)}")
+    except Exception as e:
+        logger.error(f"Remove sudo error: {e}")
+        await message.reply_text(f"❌ Error: {str(e)}")
+
+@bot.on_message(filters.command("sudolist") & filters.private & filters.user(OWNER_ID))
+async def list_sudo(client, message: Message):
+    try:
+        if not sudo_users:
+            await message.reply_text("ℹ️ **No sudo users added yet!**")
+            return
+        
+        text = "**👥 Sudo Users List:**\n\n"
+        for user_id in sudo_users:
+            try:
+                user = await client.get_users(user_id)
+                text += f"• {user.first_name} (@{user.username or 'no_username'}) - `{user.id}`\n"
+            except:
+                text += f"• Unknown User - `{user_id}`\n"
+        
+        text += f"\n**Total:** {len(sudo_users)} users"
+        await message.reply_text(text)
+    except Exception as e:
+        logger.error(f"List sudo error: {e}")
+        await message.reply_text(f"❌ Error: {str(e)}")
+
 @bot.on_message(filters.command("setdefault") & filters.private & filters.user(OWNER_ID))
 async def set_default_account(client, message: Message):
     try:
         state = get_user_state(message.from_user.id)
         state.step = "default_phone"
         state.data = {}
-        await message.reply_text("📱 **Setup Default Account**\n\nSend the phone number (with country code):\n\nExample: `+919876543210`")
+        await message.reply_text("📱 **Setup Default Account**\n\nSend the phone number (with country code):\n\n**Example:** `+919876543210`")
     except Exception as e:
         logger.error(f"Setdefault error: {e}")
         await send_error_to_owner(f"Setdefault error: {str(e)}")
 
-# Stop command
 @bot.on_message(filters.command("stop") & filters.private)
 async def stop_command(client, message: Message):
     try:
         user_id = message.from_user.id
+        
+        if not is_authorized(user_id):
+            await message.reply_text("❌ You don't have permission to use this bot!")
+            return
+        
         stopped = False
         
-        # Try to stop user's own call
         if user_id in user_calls and user_id in active_streams:
             try:
                 chat_id = active_streams[user_id]
@@ -152,7 +311,6 @@ async def stop_command(client, message: Message):
             except:
                 pass
         
-        # If owner, also try default account
         if user_id == OWNER_ID and default_calls and "default" in active_streams:
             try:
                 chat_id = active_streams["default"]
@@ -170,11 +328,15 @@ async def stop_command(client, message: Message):
         logger.error(f"Stop error: {e}")
         await message.reply_text(f"❌ Error: {str(e)}")
 
-# Logout command
 @bot.on_message(filters.command("logout") & filters.private)
 async def logout_command(client, message: Message):
     try:
         user_id = message.from_user.id
+        
+        if not is_authorized(user_id):
+            await message.reply_text("❌ You don't have permission to use this bot!")
+            return
+        
         if user_id in user_accounts:
             try:
                 if user_id in user_calls:
@@ -188,7 +350,6 @@ async def logout_command(client, message: Message):
                 
                 await user_accounts[user_id].stop()
                 
-                # Delete session file
                 session_file = f"/app/sessions/user_{user_id}.session"
                 if os.path.exists(session_file):
                     os.remove(session_file)
@@ -204,13 +365,16 @@ async def logout_command(client, message: Message):
         logger.error(f"Logout error: {e}")
         await send_error_to_owner(f"Logout command error: {str(e)}")
 
-# Callback query handler
 @bot.on_callback_query()
 async def callback_handler(client, callback_query):
     try:
         user_id = callback_query.from_user.id
         data = callback_query.data
         state = get_user_state(user_id)
+        
+        if not is_authorized(user_id):
+            await callback_query.answer("❌ You don't have permission!", show_alert=True)
+            return
 
         if data == "use_default":
             if default_account is None:
@@ -221,24 +385,95 @@ async def callback_handler(client, callback_query):
             
             state.step = "default_group"
             state.data = {"mode": "default"}
-            await callback_query.message.reply_text("📎 **Send Group Link**\n\nSend the Telegram group/channel link where you want to play audio.\n\nExample: `https://t.me/groupname`")
+            await callback_query.message.reply_text(
+                "📎 **Send Group Link**\n\n"
+                "Send the Telegram group/channel link (Public or Private):\n\n"
+                "**Examples:**\n"
+                "• Public: `https://t.me/groupname`\n"
+                "• Private: `https://t.me/+AbCdEfGhIj`\n"
+                "• Private: `https://t.me/joinchat/xxxxx`"
+            )
 
         elif data == "use_custom":
-            state.step = "custom_phone"
+            session_loaded = await check_and_load_session(user_id)
+            
+            if user_id in user_accounts or session_loaded:
+                state.step = "custom_group"
+                state.data = {"mode": "custom"}
+                await callback_query.message.reply_text(
+                    "✅ **Already Logged In!**\n\n"
+                    "📎 Send the group/channel link (Public or Private):\n\n"
+                    "**Examples:**\n"
+                    "• Public: `https://t.me/groupname`\n"
+                    "• Private: `https://t.me/+AbCdEfGhIj`\n"
+                    "• Private: `https://t.me/joinchat/xxxxx`"
+                )
+            else:
+                state.step = "custom_phone"
+                state.data = {"mode": "custom"}
+                await callback_query.message.reply_text(
+                    "📱 **Login to Your Account**\n\n"
+                    "Send your phone number (with country code):\n\n"
+                    "**Example:** `+919876543210`"
+                )
+        
+        elif data == "play_audio":
+            if user_id not in user_accounts:
+                session_loaded = await check_and_load_session(user_id)
+                if not session_loaded:
+                    await callback_query.answer("❌ Please login first!", show_alert=True)
+                    return
+            
+            state.step = "custom_group"
             state.data = {"mode": "custom"}
-            await callback_query.message.reply_text("📱 **Login to Your Account**\n\nSend your phone number (with country code):\n\nExample: `+919876543210`")
+            await callback_query.message.reply_text(
+                "📎 **Send Group Link**\n\n"
+                "Send the Telegram group/channel link (Public or Private):\n\n"
+                "**Examples:**\n"
+                "• Public: `https://t.me/groupname`\n"
+                "• Private: `https://t.me/+AbCdEfGhIj`\n"
+                "• Private: `https://t.me/joinchat/xxxxx`"
+            )
+        
+        elif data == "logout_account":
+            if user_id in user_accounts:
+                try:
+                    if user_id in user_calls:
+                        try:
+                            if user_id in active_streams:
+                                await user_calls[user_id].leave_group_call(active_streams[user_id])
+                                del active_streams[user_id]
+                        except:
+                            pass
+                        del user_calls[user_id]
+                    
+                    await user_accounts[user_id].stop()
+                    
+                    session_file = f"/app/sessions/user_{user_id}.session"
+                    if os.path.exists(session_file):
+                        os.remove(session_file)
+                    
+                    del user_accounts[user_id]
+                    await callback_query.message.reply_text("✅ Logged out successfully! Use /start to login again.")
+                except Exception as e:
+                    await callback_query.message.reply_text(f"❌ Logout failed: {str(e)}")
+            else:
+                await callback_query.answer("❌ No active session!", show_alert=True)
 
         await callback_query.answer()
     except Exception as e:
         logger.error(f"Callback error: {e}")
         await send_error_to_owner(f"Callback error: {str(e)}")
 
-# Message handler for steps
-@bot.on_message(filters.private & filters.text & ~filters.command(["start", "setdefault", "logout", "stop"]))
+@bot.on_message(filters.private & filters.text & ~filters.command(["start", "setdefault", "logout", "stop", "sudo", "rmsudo", "sudolist"]))
 async def message_handler(client, message: Message):
     global default_account, default_calls
     
     user_id = message.from_user.id
+    
+    if not is_authorized(user_id):
+        return
+    
     state = get_user_state(user_id)
     text = message.text
 
@@ -246,7 +481,6 @@ async def message_handler(client, message: Message):
         return
 
     try:
-        # Default account setup
         if state.step == "default_phone":
             phone = text.strip().replace(" ", "")
             state.data["phone"] = phone
@@ -265,7 +499,11 @@ async def message_handler(client, message: Message):
                 state.data["phone_code_hash"] = sent_code.phone_code_hash
                 state.data["client"] = user_client
                 state.step = "default_otp"
-                await processing_msg.edit_text("📨 **OTP Sent!**\n\nPlease send the OTP code you received:")
+                await processing_msg.edit_text(
+                    "📨 **OTP Sent!**\n\n"
+                    "Please send the OTP code you received.\n\n"
+                    "**Format:** `1 2 3 4 5` (space separated)"
+                )
             except FloodWait as e:
                 await processing_msg.edit_text(f"⏳ Too many requests! Wait {e.value} seconds and try again.")
                 state.step = None
@@ -325,7 +563,6 @@ async def message_handler(client, message: Message):
                 await send_error_to_owner(f"Default 2FA error: {str(e)}")
                 state.step = None
 
-        # Custom account login
         elif state.step == "custom_phone":
             phone = text.strip().replace(" ", "")
             state.data["phone"] = phone
@@ -344,7 +581,11 @@ async def message_handler(client, message: Message):
                 state.data["phone_code_hash"] = sent_code.phone_code_hash
                 state.data["client"] = user_client
                 state.step = "custom_otp"
-                await processing_msg.edit_text("📨 **OTP Sent!**\n\nPlease send the OTP code you received:")
+                await processing_msg.edit_text(
+                    "📨 **OTP Sent!**\n\n"
+                    "Please send the OTP code you received.\n\n"
+                    "**Format:** `1 2 3 4 5` (space separated)"
+                )
             except FloodWait as e:
                 await processing_msg.edit_text(f"⏳ Too many requests! Wait {e.value} seconds and try again.")
                 state.step = None
@@ -370,7 +611,13 @@ async def message_handler(client, message: Message):
                 await user_calls[user_id].start()
                 
                 state.step = "custom_group"
-                await processing_msg.edit_text("✅ **Logged in successfully!**\n\n📎 Now send the group/channel link:\n\nExample: `https://t.me/groupname`")
+                await processing_msg.edit_text(
+                    "✅ **Logged in successfully!**\n\n"
+                    "📎 Now send the group/channel link (Public or Private):\n\n"
+                    "**Examples:**\n"
+                    "• Public: `https://t.me/groupname`\n"
+                    "• Private: `https://t.me/+AbCdEfGhIj`"
+                )
             except SessionPasswordNeeded:
                 state.step = "custom_2fa"
                 await processing_msg.edit_text("🔐 **2FA Enabled**\n\nPlease send your 2FA password:")
@@ -395,7 +642,13 @@ async def message_handler(client, message: Message):
                 await user_calls[user_id].start()
                 
                 state.step = "custom_group"
-                await processing_msg.edit_text("✅ **Logged in successfully!**\n\n📎 Now send the group/channel link:\n\nExample: `https://t.me/groupname`")
+                await processing_msg.edit_text(
+                    "✅ **Logged in successfully!**\n\n"
+                    "📎 Now send the group/channel link (Public or Private):\n\n"
+                    "**Examples:**\n"
+                    "• Public: `https://t.me/groupname`\n"
+                    "• Private: `https://t.me/+AbCdEfGhIj`"
+                )
             except PasswordHashInvalid:
                 await processing_msg.edit_text("❌ Invalid 2FA password! Please start again with /start")
                 state.step = None
@@ -404,18 +657,23 @@ async def message_handler(client, message: Message):
                 await send_error_to_owner(f"Custom 2FA error: {str(e)}")
                 state.step = None
 
-        # Group link handling
         elif state.step in ["default_group", "custom_group"]:
             chat_username = extract_chat_id(text)
             if not chat_username:
-                await message.reply_text("❌ Invalid link! Please send a valid Telegram group/channel link.\n\nExample: `https://t.me/groupname`")
+                await message.reply_text("❌ Invalid link! Please send a valid Telegram group/channel link.\n\n**Example:** `https://t.me/groupname`")
                 return
             
             state.data["chat_id"] = chat_username
             state.step = "audio_input"
-            await message.reply_text("🎵 **Send Audio**\n\nYou can send:\n• Audio file\n• Voice message\n• YouTube URL\n\nExample: `https://youtube.com/watch?v=xxxxx`")
+            await message.reply_text(
+                "🎵 **Send Audio**\n\n"
+                "You can send:\n"
+                "• Audio file 🎵\n"
+                "• Voice message 🎤\n"
+                "• YouTube URL 📺\n\n"
+                "**Example:** `https://youtube.com/watch?v=xxxxx`"
+            )
 
-        # Audio/URL handling
         elif state.step == "audio_input":
             mode = state.data.get("mode")
             chat_id = state.data.get("chat_id")
@@ -434,14 +692,12 @@ async def message_handler(client, message: Message):
                 state.step = None
                 return
 
-            # Check if it's a URL
             if not (text.startswith("http://") or text.startswith("https://")):
                 await message.reply_text("❌ Please send a valid YouTube URL or send an audio file!")
                 return
 
             processing_msg = await message.reply_text("⏳ Processing...")
 
-            # Join group first
             try:
                 await processing_msg.edit_text("⏳ Joining group...")
                 await client_to_use.join_chat(chat_id)
@@ -449,7 +705,6 @@ async def message_handler(client, message: Message):
             except Exception as e:
                 logger.info(f"Join chat: {e}")
 
-            # Get chat
             try:
                 chat = await client_to_use.get_chat(chat_id)
                 actual_chat_id = chat.id
@@ -460,7 +715,6 @@ async def message_handler(client, message: Message):
                 state.step = None
                 return
 
-            # Download audio
             audio_path = await download_youtube_audio(text)
             
             if not audio_path or not os.path.exists(audio_path):
@@ -468,11 +722,9 @@ async def message_handler(client, message: Message):
                 state.step = None
                 return
 
-            # Play audio
             try:
                 await processing_msg.edit_text("⏳ Joining voice chat...")
                 
-                # Join voice chat and play with correct API
                 await calls_to_use.join_group_call(
                     actual_chat_id,
                     AudioPiped(audio_path),
@@ -495,7 +747,6 @@ async def message_handler(client, message: Message):
                     await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
                 state.step = None
             finally:
-                # Cleanup after delay
                 asyncio.create_task(cleanup_file(audio_path))
 
     except Exception as e:
@@ -504,11 +755,13 @@ async def message_handler(client, message: Message):
         await send_error_to_owner(f"Message handler error: {str(e)}")
         state.step = None
 
-# Handle audio files
 @bot.on_message(filters.private & (filters.audio | filters.voice))
 async def audio_file_handler(client, message: Message):
     user_id = message.from_user.id
     state = get_user_state(user_id)
+    
+    if not is_authorized(user_id):
+        return
     
     if state.step != "audio_input":
         return
@@ -533,7 +786,6 @@ async def audio_file_handler(client, message: Message):
 
         processing_msg = await message.reply_text("⏳ Processing audio...")
 
-        # Join group
         try:
             await processing_msg.edit_text("⏳ Joining group...")
             await client_to_use.join_chat(chat_id)
@@ -541,7 +793,6 @@ async def audio_file_handler(client, message: Message):
         except Exception as e:
             logger.info(f"Join chat: {e}")
 
-        # Get chat
         try:
             chat = await client_to_use.get_chat(chat_id)
             actual_chat_id = chat.id
@@ -551,15 +802,12 @@ async def audio_file_handler(client, message: Message):
             state.step = None
             return
 
-        # Download audio
         await processing_msg.edit_text("⏳ Downloading audio...")
         audio_path = await message.download(file_name=f"/tmp/downloads/{message.id}.mp3")
 
-        # Play audio
         try:
             await processing_msg.edit_text("⏳ Joining voice chat...")
             
-            # Join voice chat and play with correct API
             await calls_to_use.join_group_call(
                 actual_chat_id,
                 AudioPiped(audio_path),
@@ -582,7 +830,6 @@ async def audio_file_handler(client, message: Message):
                 await send_error_to_owner(f"Play error: {error_msg}\nChat: {actual_chat_id}\nFile: {audio_path}")
             state.step = None
         finally:
-            # Cleanup after delay
             asyncio.create_task(cleanup_file(audio_path))
 
     except Exception as e:
@@ -592,21 +839,20 @@ async def audio_file_handler(client, message: Message):
         state.step = None
 
 async def cleanup_file(file_path):
-    """Cleanup downloaded file after some delay"""
     try:
-        await asyncio.sleep(300)  # Wait 5 minutes
+        await asyncio.sleep(300)
         if os.path.exists(file_path):
             os.remove(file_path)
             logger.info(f"Cleaned up: {file_path}")
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
 
-# Run bot
 if __name__ == "__main__":
     try:
         logger.info("🚀 Starting VC Fighting Bot...")
         logger.info(f"Owner ID: {OWNER_ID}")
         logger.info(f"API ID: {API_ID}")
+        logger.info("Powered by @zudo_userbot")
         bot.run()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
