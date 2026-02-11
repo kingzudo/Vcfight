@@ -4,3 +4,4 @@ py-tgcalls==0.9.7
 yt-dlp==2024.8.6
 aiohttp==3.9.5
 aiofiles==23.2.1
+ffmpeg-python==0.2.0
