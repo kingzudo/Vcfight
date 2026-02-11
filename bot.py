@@ -122,23 +122,6 @@ def is_authorized(user_id):
     return user_id == OWNER_ID or user_id in sudo_users
 
 
-# ✅ OTP SANITIZER (MAIN FIX)
-def normalize_otp(text: str) -> str:
-    """
-    Accepts OTP in any format:
-    - "12345"
-    - "1 2 3 4 5"
-    - "1-2-3-4-5"
-    - " 1 2 3 4 5 "
-    Returns digits-only string: "12345"
-    """
-    if not text:
-        return ""
-    # keep only digits
-    code = re.sub(r"\D", "", text)
-    return code
-
-
 def extract_chat_info(text):
     """Extract chat username or invite link"""
     text = text.strip()
@@ -193,7 +176,6 @@ async def find_chat_in_dialogs_advanced(client, invite_hash=None, username=None)
                                 logger.info(f"✅ Found via invite_link: {chat.id} - {chat.title}")
                                 return chat.id, chat.title
 
-                        # get_chat_invite_link may require admin in some cases -> ignore if fails
                         try:
                             invite_links = await client.get_chat_invite_link(chat.id)
                             if hasattr(invite_links, 'invite_link') and invite_hash in invite_links.invite_link:
@@ -203,7 +185,6 @@ async def find_chat_in_dialogs_advanced(client, invite_hash=None, username=None)
                             pass
 
                     except Exception:
-                        # fallback basic checks
                         if hasattr(chat, 'invite_link') and chat.invite_link:
                             if invite_hash in chat.invite_link:
                                 logger.info(f"✅ Found via basic check: {chat.id} - {chat.title}")
@@ -237,13 +218,11 @@ async def get_chat_id_smart(client, chat_info, user_key):
             username = chat_info["value"]
             cache_key = f"{user_key}_user_{username}"
 
-            # Step 1: Check cache
             if cache_key in chat_id_cache:
                 cached_id, cached_title = chat_id_cache[cache_key]
                 logger.info(f"✅ CACHE HIT for @{username}: {cached_id}")
                 return True, cached_id, cached_title, None, False
 
-            # Step 2: Try direct get_chat
             try:
                 chat = await client.get_chat(username)
                 chat_id_cache[cache_key] = (chat.id, chat.title)
@@ -253,7 +232,6 @@ async def get_chat_id_smart(client, chat_info, user_key):
             except Exception as e:
                 logger.debug(f"get_chat failed for @{username}: {e}")
 
-            # Step 3: Try join
             try:
                 await client.join_chat(username)
                 logger.info(f"✅ Joined @{username}")
@@ -262,7 +240,6 @@ async def get_chat_id_smart(client, chat_info, user_key):
             except Exception as join_err:
                 logger.debug(f"Join error for @{username}: {join_err}")
 
-            # Step 4: Try get_chat again
             try:
                 chat = await client.get_chat(username)
                 chat_id_cache[cache_key] = (chat.id, chat.title)
@@ -272,7 +249,6 @@ async def get_chat_id_smart(client, chat_info, user_key):
             except Exception as e:
                 logger.debug(f"get_chat after join failed: {e}")
 
-            # Step 5: Search in dialogs
             chat_id, chat_title = await find_chat_in_dialogs_advanced(client, username=username)
             if chat_id:
                 chat_id_cache[cache_key] = (chat_id, chat_title)
@@ -286,13 +262,11 @@ async def get_chat_id_smart(client, chat_info, user_key):
             invite_hash = chat_info.get("hash", "")
             cache_key = f"{user_key}_inv_{invite_hash}"
 
-            # Step 1: Check cache
             if cache_key in chat_id_cache:
                 cached_id, cached_title = chat_id_cache[cache_key]
                 logger.info(f"✅ CACHE HIT for invite: {cached_id}")
                 return True, cached_id, cached_title, None, False
 
-            # Step 2: Try join_chat
             try:
                 chat = await client.join_chat(chat_info["value"])
                 chat_id_cache[cache_key] = (chat.id, chat.title)
@@ -303,7 +277,6 @@ async def get_chat_id_smart(client, chat_info, user_key):
             except UserAlreadyParticipant:
                 logger.info(f"✅ Already member, searching in dialogs...")
 
-                # Step 3: Deep search in dialogs
                 chat_id, chat_title = await find_chat_in_dialogs_advanced(client, invite_hash=invite_hash)
 
                 if chat_id:
@@ -312,7 +285,6 @@ async def get_chat_id_smart(client, chat_info, user_key):
                     logger.info(f"✅ DIALOGS SEARCH found: {chat_id} - {chat_title}")
                     return True, chat_id, chat_title, None, False
 
-                # Step 4: Request chat_id from user
                 error_msg = (
                     "⚠️ **Cannot find the private group automatically.**\n\n"
                     "**Please send the Chat ID:**\n\n"
@@ -361,7 +333,6 @@ async def rejoin_and_play(client, calls, chat_id, audio_path, stream_key):
     try:
         logger.info(f"🔄 Attempting rejoin strategy for chat {chat_id}")
 
-        # Step 1: Try to leave current call (if any)
         try:
             await calls.leave_group_call(chat_id)
             await asyncio.sleep(2)
@@ -369,7 +340,6 @@ async def rejoin_and_play(client, calls, chat_id, audio_path, stream_key):
         except:
             pass
 
-        # Step 2: Leave the group
         try:
             await client.leave_chat(chat_id)
             await asyncio.sleep(3)
@@ -378,7 +348,6 @@ async def rejoin_and_play(client, calls, chat_id, audio_path, stream_key):
             logger.error(f"Failed to leave group: {e}")
             return False, f"Cannot leave group: {str(e)}"
 
-        # Step 3: Rejoin the group
         try:
             chat = await client.get_chat(chat_id)
 
@@ -393,7 +362,6 @@ async def rejoin_and_play(client, calls, chat_id, audio_path, stream_key):
             logger.error(f"Failed to rejoin: {e}")
             return False, f"Cannot rejoin group: {str(e)}"
 
-        # Step 4: Try to join VC again
         try:
             await calls.join_group_call(
                 chat_id,
@@ -481,13 +449,9 @@ async def check_and_load_session(user_id):
 
 
 # =========================
-# ✅ AUTO VC LEAVE (MAIN REQUIREMENT)
+# ✅ AUTO VC LEAVE
 # =========================
 async def get_audio_duration_seconds(file_path: str) -> int:
-    """
-    Try to detect duration using ffprobe.
-    Returns seconds (int). 0 => unknown.
-    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error",
@@ -510,19 +474,14 @@ async def get_audio_duration_seconds(file_path: str) -> int:
 
 
 async def auto_leave_after_playback(calls_to_use, stream_key, chat_id, audio_path):
-    """
-    Wait duration, then auto leave VC if still same stream active.
-    """
     try:
         dur = await get_audio_duration_seconds(audio_path)
         if dur <= 0:
-            # If duration unknown, we don't auto leave (safe)
             logger.warning("⚠️ Could not detect duration, auto-leave skipped.")
             return
 
         await asyncio.sleep(dur + 2)
 
-        # If user already stopped / changed stream, don't leave wrong chat
         if active_streams.get(stream_key) != chat_id:
             return
 
@@ -541,6 +500,107 @@ async def auto_leave_after_playback(calls_to_use, stream_key, chat_id, audio_pat
         logger.error(f"auto_leave_after_playback error: {e}")
 
 
+# =========================
+# ✅ MAIN FIX: HARD LOGOUT (NO FAIL EVEN IF TERMINATED)
+# =========================
+async def hard_logout_user(user_id: int):
+    """
+    Logout that never fails due to 'Client is already terminated'.
+    - Leaves VC if possible
+    - Stops PyTgCalls
+    - Stops pyrogram Client (ignore terminated)
+    - Deletes session file
+    - Clears memory refs + user state
+    """
+    # stop active stream mapping
+    try:
+        if user_id in active_streams:
+            del active_streams[user_id]
+    except:
+        pass
+
+    # stop pytgcalls
+    if user_id in user_calls:
+        try:
+            calls = user_calls[user_id]
+            # Try leave VC gracefully if we still know chat_id (best-effort)
+            try:
+                chat_id = active_streams.get(user_id)
+                if chat_id:
+                    try:
+                        await calls.leave_group_call(chat_id)
+                    except:
+                        pass
+            except:
+                pass
+
+            try:
+                await calls.stop()
+            except Exception:
+                pass
+        finally:
+            try:
+                del user_calls[user_id]
+            except:
+                pass
+
+    # stop pyrogram client
+    if user_id in user_accounts:
+        try:
+            acc = user_accounts[user_id]
+            try:
+                await acc.stop()
+            except Exception:
+                pass
+        finally:
+            try:
+                del user_accounts[user_id]
+            except:
+                pass
+
+    # delete session file (and related wal/shm if any)
+    session_base = f"/app/sessions/user_{user_id}.session"
+    try:
+        if os.path.exists(session_base):
+            os.remove(session_base)
+    except:
+        pass
+
+    for ext in ["-wal", "-shm", "-journal"]:
+        try:
+            p = session_base + ext
+            if os.path.exists(p):
+                os.remove(p)
+        except:
+            pass
+
+    # reset state
+    try:
+        st = get_user_state(user_id)
+        st.step = None
+        st.data = {}
+    except:
+        pass
+
+    return True
+
+
+# ✅ NEW: helper to safely cleanup dangling login client (only for OTP/2FA state missing cases)
+async def safe_stop_state_client(state: UserState):
+    try:
+        c = state.data.get("client")
+        if c:
+            try:
+                await c.stop()
+            except:
+                try:
+                    await c.disconnect()
+                except:
+                    pass
+    except:
+        pass
+
+
 @bot.on_message(filters.command("start") & filters.private)
 async def start_command(client, message: Message):
     try:
@@ -554,48 +614,44 @@ async def start_command(client, message: Message):
             )
             return
 
-        session_loaded = await check_and_load_session(user_id)
+        # auto load if session exists
+        await check_and_load_session(user_id)
 
-        if user_id in user_accounts or session_loaded:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎵 Play Audio", callback_data="play_audio")],
-                [InlineKeyboardButton("🚪 Logout", callback_data="logout_account")]
-            ])
-            await message.reply_text(
-                "**🎵 Welcome Back!**\n\n"
-                "You're already logged in! ✅\n\n"
-                "Choose an option:\n\n"
-                "**Powered by** @zudo_userbot",
-                reply_markup=keyboard
+        buttons = []
+        if default_account is not None:
+            buttons.append([InlineKeyboardButton("🔵 Default Account", callback_data="use_default")])
+
+        buttons.append([InlineKeyboardButton("🟢 Login / Use My Account", callback_data="use_custom")])
+
+        if user_id in user_accounts:
+            buttons.append([InlineKeyboardButton("🎵 Play Audio (My Account)", callback_data="play_audio")])
+            buttons.append([InlineKeyboardButton("🚪 Logout (My Account)", callback_data="logout_account")])
+
+        keyboard = InlineKeyboardMarkup(buttons)
+
+        commands_text = ""
+        if user_id == OWNER_ID:
+            commands_text = (
+                "\n\n**Owner Commands:**\n"
+                "• /setdefault - Setup default account\n"
+                "• /sudo <username/userid> - Add sudo user\n"
+                "• /rmsudo <username/userid> - Remove sudo user\n"
+                "• /sudolist - List all sudo users"
             )
-        else:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔵 Default Account", callback_data="use_default")],
-                [InlineKeyboardButton("🟢 Login My Account", callback_data="use_custom")]
-            ])
 
-            commands_text = ""
-            if user_id == OWNER_ID:
-                commands_text = (
-                    "\n\n**Owner Commands:**\n"
-                    "• /setdefault - Setup default account\n"
-                    "• /sudo <username/userid> - Add sudo user\n"
-                    "• /rmsudo <username/userid> - Remove sudo user\n"
-                    "• /sudolist - List all sudo users"
-                )
+        await message.reply_text(
+            "**🎵 Welcome to VC Fighting Bot!**\n\n"
+            "Choose what you want to use:\n"
+            "• **Default Account** (if configured)\n"
+            "• **My Account** (login/use your own)\n\n"
+            "**Commands:**\n"
+            "• /logout - Force logout + delete session\n"
+            "• /stop - Stop playing audio in your active group"
+            f"{commands_text}\n\n"
+            "**Powered by** @zudo_userbot",
+            reply_markup=keyboard
+        )
 
-            await message.reply_text(
-                "**🎵 Welcome to VC Fighting Bot!**\n\n"
-                "Choose an option:\n"
-                "• **Default Account**: Use pre-configured account\n"
-                "• **Login My Account**: Use your own account\n\n"
-                "**Commands:**\n"
-                "• /logout - Logout from your account\n"
-                "• /stop - Stop playing audio in your active group"
-                f"{commands_text}\n\n"
-                "**Powered by** @zudo_userbot",
-                reply_markup=keyboard
-            )
     except Exception as e:
         logger.error(f"Start command error: {e}")
         await send_error_to_owner(f"Start command error: {str(e)}")
@@ -709,7 +765,6 @@ async def stop_command(client, message: Message):
         stopped = False
         chat_name = None
 
-        # stop for custom stream
         if user_id in active_streams and user_id in user_calls:
             try:
                 chat_id = active_streams[user_id]
@@ -726,7 +781,6 @@ async def stop_command(client, message: Message):
             except Exception as e:
                 logger.error(f"Error stopping for user {user_id}: {e}")
 
-        # stop for owner default
         elif user_id == OWNER_ID and "default" in active_streams and default_calls:
             try:
                 chat_id = active_streams["default"]
@@ -763,32 +817,20 @@ async def logout_command(client, message: Message):
             await message.reply_text("❌ You don't have permission to use this bot!")
             return
 
-        if user_id in user_accounts:
-            try:
-                if user_id in user_calls:
-                    try:
-                        if user_id in active_streams:
-                            await user_calls[user_id].leave_group_call(active_streams[user_id])
-                            del active_streams[user_id]
-                    except:
-                        pass
-                    del user_calls[user_id]
+        await hard_logout_user(user_id)
 
-                await user_accounts[user_id].stop()
+        session_file = f"/app/sessions/user_{user_id}.session"
+        try:
+            if os.path.exists(session_file):
+                os.remove(session_file)
+        except:
+            pass
 
-                session_file = f"/app/sessions/user_{user_id}.session"
-                if os.path.exists(session_file):
-                    os.remove(session_file)
+        await message.reply_text("✅ Logged out successfully! (Session deleted completely)")
 
-                del user_accounts[user_id]
-                await message.reply_text("✅ Logged out successfully!")
-            except Exception as e:
-                await message.reply_text(f"❌ Logout failed: {str(e)}")
-                await send_error_to_owner(f"Logout error: {str(e)}")
-        else:
-            await message.reply_text("❌ No active session found!")
     except Exception as e:
         logger.error(f"Logout error: {e}")
+        await message.reply_text(f"❌ Logout failed: {str(e)}")
         await send_error_to_owner(f"Logout command error: {str(e)}")
 
 
@@ -827,7 +869,7 @@ async def callback_handler(client, callback_query):
                 state.step = "custom_group"
                 state.data = {"mode": "custom"}
                 await callback_query.message.reply_text(
-                    "✅ **Already Logged In!**\n\n"
+                    "✅ **My Account Ready!**\n\n"
                     "📎 **Send Group Info**\n\n"
                     "**For Public Groups:**\n"
                     "Send username: `@groupusername`\n\n"
@@ -860,31 +902,11 @@ async def callback_handler(client, callback_query):
             )
 
         elif data == "logout_account":
-            if user_id in user_accounts:
-                try:
-                    if user_id in user_calls:
-                        try:
-                            if user_id in active_streams:
-                                await user_calls[user_id].leave_group_call(active_streams[user_id])
-                                del active_streams[user_id]
-                        except:
-                            pass
-                        del user_calls[user_id]
-
-                    await user_accounts[user_id].stop()
-
-                    session_file = f"/app/sessions/user_{user_id}.session"
-                    if os.path.exists(session_file):
-                        os.remove(session_file)
-
-                    del user_accounts[user_id]
-                    await callback_query.message.reply_text("✅ Logged out successfully! Use /start to login again.")
-                except Exception as e:
-                    await callback_query.message.reply_text(f"❌ Logout failed: {str(e)}")
-            else:
-                await callback_query.answer("❌ No active session!", show_alert=True)
+            await hard_logout_user(user_id)
+            await callback_query.message.reply_text("✅ Logged out successfully! Use /start to login again.")
 
         await callback_query.answer()
+
     except Exception as e:
         logger.error(f"Callback error: {e}")
         await send_error_to_owner(f"Callback error: {str(e)}")
@@ -935,13 +957,16 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "default_otp":
-            # ✅ FIX: accept "1 2 3 4 5" etc.
-            otp = normalize_otp(text)
-            processing_msg = await message.reply_text("⏳ Verifying OTP...")
-
-            if not otp:
-                await processing_msg.edit_text("❌ OTP empty! Please send OTP like: `1 2 3 4 5` or `12345`")
+            # ✅ FIX: prevent KeyError('phone') / missing hash/client
+            if not state.data.get("client") or not state.data.get("phone") or not state.data.get("phone_code_hash"):
+                await safe_stop_state_client(state)
+                state.step = None
+                state.data = {}
+                await message.reply_text("❌ OTP session missing/expired. Please use /setdefault and login again.")
                 return
+
+            otp = text.strip().replace(" ", "").replace("-", "")
+            processing_msg = await message.reply_text("⏳ Verifying OTP...")
 
             try:
                 user_client = state.data["client"]
@@ -961,7 +986,7 @@ async def message_handler(client, message: Message):
                 state.step = "default_2fa"
                 await processing_msg.edit_text("🔐 **2FA Enabled**\n\nPlease send your 2FA password:")
             except PhoneCodeInvalid:
-                await processing_msg.edit_text("❌ Invalid/Expired OTP! Please use /setdefault to try again.")
+                await processing_msg.edit_text("❌ Invalid OTP! Please use /setdefault to try again.")
                 state.step = None
             except Exception as e:
                 await processing_msg.edit_text(f"❌ Error: {str(e)}")
@@ -969,6 +994,14 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "default_2fa":
+            # ✅ FIX: prevent missing state
+            if not state.data.get("client"):
+                await safe_stop_state_client(state)
+                state.step = None
+                state.data = {}
+                await message.reply_text("❌ 2FA session missing/expired. Please use /setdefault and login again.")
+                return
+
             password = text.strip()
             processing_msg = await message.reply_text("⏳ Verifying 2FA password...")
 
@@ -998,6 +1031,8 @@ async def message_handler(client, message: Message):
             processing_msg = await message.reply_text("⏳ Sending OTP...")
 
             try:
+                await hard_logout_user(user_id)
+
                 user_client = Client(
                     f"user_{user_id}",
                     api_id=API_ID,
@@ -1019,13 +1054,16 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "custom_otp":
-            # ✅ FIX: accept "1 2 3 4 5" etc.
-            otp = normalize_otp(text)
-            processing_msg = await message.reply_text("⏳ Verifying OTP...")
-
-            if not otp:
-                await processing_msg.edit_text("❌ OTP empty! Please send OTP like: `1 2 3 4 5` or `12345`")
+            # ✅ FIX: This is the exact crash cause (KeyError: 'phone')
+            if not state.data.get("client") or not state.data.get("phone") or not state.data.get("phone_code_hash"):
+                await safe_stop_state_client(state)
+                state.step = None
+                state.data = {}
+                await message.reply_text("❌ OTP session missing/expired. Please use /start and login again.")
                 return
+
+            otp = text.strip().replace(" ", "").replace("-", "")
+            processing_msg = await message.reply_text("⏳ Verifying OTP...")
 
             try:
                 user_client = state.data["client"]
@@ -1052,7 +1090,7 @@ async def message_handler(client, message: Message):
                 state.step = "custom_2fa"
                 await processing_msg.edit_text("🔐 **2FA Enabled**\n\nPlease send your 2FA password:")
             except PhoneCodeInvalid:
-                await processing_msg.edit_text("❌ Invalid/Expired OTP! Please start again with /start")
+                await processing_msg.edit_text("❌ Invalid OTP! Please start again with /start")
                 state.step = None
             except Exception as e:
                 await processing_msg.edit_text(f"❌ Error: {str(e)}")
@@ -1060,6 +1098,14 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "custom_2fa":
+            # ✅ FIX: prevent missing state
+            if not state.data.get("client"):
+                await safe_stop_state_client(state)
+                state.step = None
+                state.data = {}
+                await message.reply_text("❌ 2FA session missing/expired. Please use /start and login again.")
+                return
+
             password = text.strip()
             processing_msg = await message.reply_text("⏳ Verifying 2FA password...")
 
@@ -1088,7 +1134,6 @@ async def message_handler(client, message: Message):
                 await send_error_to_owner(f"Custom 2FA error: {str(e)}")
                 state.step = None
 
-        # Handle Chat ID input (for private groups)
         elif state.step == "waiting_chat_id":
             chat_id_input = text.strip()
 
@@ -1113,7 +1158,6 @@ async def message_handler(client, message: Message):
                 )
             return
 
-        # Group input handler
         elif state.step in ["default_group", "custom_group"]:
             chat_info = extract_chat_info(text)
 
@@ -1129,7 +1173,6 @@ async def message_handler(client, message: Message):
 
             state.data["chat_info"] = chat_info
 
-            # For private groups, try smart resolve. If can't -> ask chat id
             if chat_info["type"] == "invite":
                 mode = state.data.get("mode")
 
@@ -1178,7 +1221,6 @@ async def message_handler(client, message: Message):
                     "• YouTube URL 📺"
                 )
 
-        # YouTube URL play handler
         elif state.step == "audio_input":
             mode = state.data.get("mode")
             chat_info = state.data.get("chat_info")
@@ -1203,7 +1245,6 @@ async def message_handler(client, message: Message):
 
             processing_msg = await message.reply_text("⏳ Processing...")
 
-            # Get chat_id
             if "actual_chat_id" in state.data:
                 actual_chat_id = state.data["actual_chat_id"]
                 chat_title = state.data.get("chat_title", "Group")
@@ -1235,13 +1276,11 @@ async def message_handler(client, message: Message):
                     stream_type=StreamType().pulse_stream
                 )
 
-                # Store active stream
                 if mode == "custom":
                     active_streams[user_id] = actual_chat_id
                 else:
                     active_streams["default"] = actual_chat_id
 
-                # ✅ MAIN FIX: auto leave after playback completes
                 asyncio.create_task(auto_leave_after_playback(calls_to_use, stream_key, actual_chat_id, audio_path))
 
                 logger.info(f"✅ Stream started - Key: {stream_key}, Chat: {actual_chat_id}")
@@ -1270,7 +1309,6 @@ async def message_handler(client, message: Message):
                         else:
                             active_streams["default"] = actual_chat_id
 
-                        # ✅ auto leave after playback completes (rejoin case)
                         asyncio.create_task(auto_leave_after_playback(calls_to_use, stream_key, actual_chat_id, audio_path))
 
                         await processing_msg.edit_text(
@@ -1342,7 +1380,6 @@ async def audio_file_handler(client, message: Message):
 
         processing_msg = await message.reply_text("⏳ Processing audio...")
 
-        # Get chat_id
         if "actual_chat_id" in state.data:
             actual_chat_id = state.data["actual_chat_id"]
             chat_title = state.data.get("chat_title", "Group")
@@ -1374,7 +1411,6 @@ async def audio_file_handler(client, message: Message):
             else:
                 active_streams["default"] = actual_chat_id
 
-            # ✅ MAIN FIX: auto leave after playback completes
             asyncio.create_task(auto_leave_after_playback(calls_to_use, stream_key, actual_chat_id, audio_path))
 
             logger.info(f"✅ Stream started - Key: {stream_key}, Chat: {actual_chat_id}")
@@ -1403,7 +1439,6 @@ async def audio_file_handler(client, message: Message):
                     else:
                         active_streams["default"] = actual_chat_id
 
-                    # ✅ auto leave after playback completes (rejoin case)
                     asyncio.create_task(auto_leave_after_playback(calls_to_use, stream_key, actual_chat_id, audio_path))
 
                     await processing_msg.edit_text(
@@ -1453,9 +1488,9 @@ if __name__ == "__main__":
         logger.info("🚀 Starting VC Fighting Bot...")
         logger.info(f"Owner ID: {OWNER_ID}")
         logger.info(f"API ID: {API_ID}")
-        logger.info("✅ COMPLETE VERSION - OTP spaced format fixed")
-        logger.info("🔥 Each user has independent stream control")
-        logger.info("🔥 /stop only affects the user who executed it")
+        logger.info("✅ FIXED VERSION - OTP KeyError('phone') Guard Added")
+        logger.info("✅ FIXED VERSION - Default option always visible + Hard Logout")
+        logger.info("🔥 /logout deletes session even if client terminated")
         logger.info("✅ Auto leave after audio finished enabled")
         logger.info("Powered by @zudo_userbot")
         bot.run()
