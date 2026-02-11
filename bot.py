@@ -18,9 +18,9 @@ from pathlib import Path
 
 # Configuration
 OWNER_ID = 7661825494
-BOT_TOKEN = "7845373810:AAH5jWEJhLoObAwFXxjK6KFpwGZ2Y1N2fE0"
-API_ID = 33628258
-API_HASH = "0850762925b9c1715b9b122f7b753128"
+BOT_TOKEN = "7845373810:AAGysQmUatBcQQl19igxLSu2_QDD-lBqECM"
+API_ID = 30440363
+API_HASH = "f0e568aa7a7c93101947781019fe5668"
 
 # Setup directories
 Path("/tmp/downloads").mkdir(exist_ok=True, parents=True)
