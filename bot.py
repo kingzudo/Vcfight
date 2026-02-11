@@ -537,7 +537,6 @@ async def hard_logout_user(user_id: int):
             try:
                 await calls.stop()
             except Exception:
-                # If already terminated / not started
                 pass
         finally:
             try:
@@ -552,7 +551,6 @@ async def hard_logout_user(user_id: int):
             try:
                 await acc.stop()
             except Exception:
-                # 'Client is already terminated' etc -> ignore
                 pass
         finally:
             try:
@@ -568,7 +566,6 @@ async def hard_logout_user(user_id: int):
     except:
         pass
 
-    # also cleanup possible journal files (safe)
     for ext in ["-wal", "-shm", "-journal"]:
         try:
             p = session_base + ext
@@ -577,7 +574,7 @@ async def hard_logout_user(user_id: int):
         except:
             pass
 
-    # reset state (so next login clean)
+    # reset state
     try:
         st = get_user_state(user_id)
         st.step = None
@@ -586,6 +583,22 @@ async def hard_logout_user(user_id: int):
         pass
 
     return True
+
+
+# ✅ NEW: helper to safely cleanup dangling login client (only for OTP/2FA state missing cases)
+async def safe_stop_state_client(state: UserState):
+    try:
+        c = state.data.get("client")
+        if c:
+            try:
+                await c.stop()
+            except:
+                try:
+                    await c.disconnect()
+                except:
+                    pass
+    except:
+        pass
 
 
 @bot.on_message(filters.command("start") & filters.private)
@@ -604,15 +617,12 @@ async def start_command(client, message: Message):
         # auto load if session exists
         await check_and_load_session(user_id)
 
-        # ✅ FIX: Always show Default + Custom choice (if default configured)
         buttons = []
         if default_account is not None:
             buttons.append([InlineKeyboardButton("🔵 Default Account", callback_data="use_default")])
 
-        # Always allow user to use his own (login/play)
         buttons.append([InlineKeyboardButton("🟢 Login / Use My Account", callback_data="use_custom")])
 
-        # Play button should work if user already logged in
         if user_id in user_accounts:
             buttons.append([InlineKeyboardButton("🎵 Play Audio (My Account)", callback_data="play_audio")])
             buttons.append([InlineKeyboardButton("🚪 Logout (My Account)", callback_data="logout_account")])
@@ -807,10 +817,8 @@ async def logout_command(client, message: Message):
             await message.reply_text("❌ You don't have permission to use this bot!")
             return
 
-        # ✅ FIX: Always hard logout even if session not loaded
         await hard_logout_user(user_id)
 
-        # If some user only had session file but not loaded, also ensure delete:
         session_file = f"/app/sessions/user_{user_id}.session"
         try:
             if os.path.exists(session_file):
@@ -894,7 +902,6 @@ async def callback_handler(client, callback_query):
             )
 
         elif data == "logout_account":
-            # ✅ FIX: Use same hard logout
             await hard_logout_user(user_id)
             await callback_query.message.reply_text("✅ Logged out successfully! Use /start to login again.")
 
@@ -950,6 +957,14 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "default_otp":
+            # ✅ FIX: prevent KeyError('phone') / missing hash/client
+            if not state.data.get("client") or not state.data.get("phone") or not state.data.get("phone_code_hash"):
+                await safe_stop_state_client(state)
+                state.step = None
+                state.data = {}
+                await message.reply_text("❌ OTP session missing/expired. Please use /setdefault and login again.")
+                return
+
             otp = text.strip().replace(" ", "").replace("-", "")
             processing_msg = await message.reply_text("⏳ Verifying OTP...")
 
@@ -979,6 +994,14 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "default_2fa":
+            # ✅ FIX: prevent missing state
+            if not state.data.get("client"):
+                await safe_stop_state_client(state)
+                state.step = None
+                state.data = {}
+                await message.reply_text("❌ 2FA session missing/expired. Please use /setdefault and login again.")
+                return
+
             password = text.strip()
             processing_msg = await message.reply_text("⏳ Verifying 2FA password...")
 
@@ -1008,7 +1031,6 @@ async def message_handler(client, message: Message):
             processing_msg = await message.reply_text("⏳ Sending OTP...")
 
             try:
-                # ✅ FIX: If any stale session exists in memory, cleanup first (prevents re-login issues)
                 await hard_logout_user(user_id)
 
                 user_client = Client(
@@ -1032,6 +1054,14 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "custom_otp":
+            # ✅ FIX: This is the exact crash cause (KeyError: 'phone')
+            if not state.data.get("client") or not state.data.get("phone") or not state.data.get("phone_code_hash"):
+                await safe_stop_state_client(state)
+                state.step = None
+                state.data = {}
+                await message.reply_text("❌ OTP session missing/expired. Please use /start and login again.")
+                return
+
             otp = text.strip().replace(" ", "").replace("-", "")
             processing_msg = await message.reply_text("⏳ Verifying OTP...")
 
@@ -1068,6 +1098,14 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "custom_2fa":
+            # ✅ FIX: prevent missing state
+            if not state.data.get("client"):
+                await safe_stop_state_client(state)
+                state.step = None
+                state.data = {}
+                await message.reply_text("❌ 2FA session missing/expired. Please use /start and login again.")
+                return
+
             password = text.strip()
             processing_msg = await message.reply_text("⏳ Verifying 2FA password...")
 
@@ -1450,6 +1488,7 @@ if __name__ == "__main__":
         logger.info("🚀 Starting VC Fighting Bot...")
         logger.info(f"Owner ID: {OWNER_ID}")
         logger.info(f"API ID: {API_ID}")
+        logger.info("✅ FIXED VERSION - OTP KeyError('phone') Guard Added")
         logger.info("✅ FIXED VERSION - Default option always visible + Hard Logout")
         logger.info("🔥 /logout deletes session even if client terminated")
         logger.info("✅ Auto leave after audio finished enabled")
