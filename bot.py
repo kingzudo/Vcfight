@@ -122,6 +122,23 @@ def is_authorized(user_id):
     return user_id == OWNER_ID or user_id in sudo_users
 
 
+# ✅ OTP SANITIZER (MAIN FIX)
+def normalize_otp(text: str) -> str:
+    """
+    Accepts OTP in any format:
+    - "12345"
+    - "1 2 3 4 5"
+    - "1-2-3-4-5"
+    - " 1 2 3 4 5 "
+    Returns digits-only string: "12345"
+    """
+    if not text:
+        return ""
+    # keep only digits
+    code = re.sub(r"\D", "", text)
+    return code
+
+
 def extract_chat_info(text):
     """Extract chat username or invite link"""
     text = text.strip()
@@ -918,8 +935,13 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "default_otp":
-            otp = text.strip().replace(" ", "").replace("-", "")
+            # ✅ FIX: accept "1 2 3 4 5" etc.
+            otp = normalize_otp(text)
             processing_msg = await message.reply_text("⏳ Verifying OTP...")
+
+            if not otp:
+                await processing_msg.edit_text("❌ OTP empty! Please send OTP like: `1 2 3 4 5` or `12345`")
+                return
 
             try:
                 user_client = state.data["client"]
@@ -939,7 +961,7 @@ async def message_handler(client, message: Message):
                 state.step = "default_2fa"
                 await processing_msg.edit_text("🔐 **2FA Enabled**\n\nPlease send your 2FA password:")
             except PhoneCodeInvalid:
-                await processing_msg.edit_text("❌ Invalid OTP! Please use /setdefault to try again.")
+                await processing_msg.edit_text("❌ Invalid/Expired OTP! Please use /setdefault to try again.")
                 state.step = None
             except Exception as e:
                 await processing_msg.edit_text(f"❌ Error: {str(e)}")
@@ -997,8 +1019,13 @@ async def message_handler(client, message: Message):
                 state.step = None
 
         elif state.step == "custom_otp":
-            otp = text.strip().replace(" ", "").replace("-", "")
+            # ✅ FIX: accept "1 2 3 4 5" etc.
+            otp = normalize_otp(text)
             processing_msg = await message.reply_text("⏳ Verifying OTP...")
+
+            if not otp:
+                await processing_msg.edit_text("❌ OTP empty! Please send OTP like: `1 2 3 4 5` or `12345`")
+                return
 
             try:
                 user_client = state.data["client"]
@@ -1025,7 +1052,7 @@ async def message_handler(client, message: Message):
                 state.step = "custom_2fa"
                 await processing_msg.edit_text("🔐 **2FA Enabled**\n\nPlease send your 2FA password:")
             except PhoneCodeInvalid:
-                await processing_msg.edit_text("❌ Invalid OTP! Please start again with /start")
+                await processing_msg.edit_text("❌ Invalid/Expired OTP! Please start again with /start")
                 state.step = None
             except Exception as e:
                 await processing_msg.edit_text(f"❌ Error: {str(e)}")
@@ -1426,7 +1453,7 @@ if __name__ == "__main__":
         logger.info("🚀 Starting VC Fighting Bot...")
         logger.info(f"Owner ID: {OWNER_ID}")
         logger.info(f"API ID: {API_ID}")
-        logger.info("✅ COMPLETE VERSION - Sudo Users /stop Fixed!")
+        logger.info("✅ COMPLETE VERSION - OTP spaced format fixed")
         logger.info("🔥 Each user has independent stream control")
         logger.info("🔥 /stop only affects the user who executed it")
         logger.info("✅ Auto leave after audio finished enabled")
