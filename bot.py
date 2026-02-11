@@ -50,7 +50,7 @@ default_account = None
 user_accounts = {}
 default_calls = None
 user_calls = {}
-active_streams = {}
+active_streams = {}  # Format: {user_id: chat_id} - Tracks which user is playing in which chat
 sudo_users = set()
 chat_id_cache = {}
 
@@ -497,7 +497,7 @@ async def start_command(client, message: Message):
                 "• **Login My Account**: Use your own account\n\n"
                 "**Commands:**\n"
                 "• /logout - Logout from your account\n"
-                "• /stop - Stop playing audio"
+                "• /stop - Stop playing audio in your active group"
                 f"{commands_text}\n\n"
                 "**Powered by** @zudo_userbot",
                 reply_markup=keyboard
@@ -602,32 +602,64 @@ async def stop_command(client, message: Message):
             return
         
         stopped = False
+        chat_name = None
         
-        if user_id in user_calls and user_id in active_streams:
-            try:
-                chat_id = active_streams[user_id]
-                await user_calls[user_id].leave_group_call(chat_id)
-                del active_streams[user_id]
-                stopped = True
-            except:
-                pass
+        # NEW: Check if this specific user has an active stream
+        if user_id in active_streams:
+            # This user (sudo or owner using custom account) has an active stream
+            if user_id in user_calls:
+                try:
+                    chat_id = active_streams[user_id]
+                    
+                    # Get chat name for confirmation
+                    try:
+                        if user_id in user_accounts:
+                            chat = await user_accounts[user_id].get_chat(chat_id)
+                        else:
+                            chat = await bot.get_chat(chat_id)
+                        chat_name = chat.title
+                    except:
+                        chat_name = f"Chat {chat_id}"
+                    
+                    await user_calls[user_id].leave_group_call(chat_id)
+                    del active_streams[user_id]
+                    stopped = True
+                    logger.info(f"✅ User {user_id} stopped playing in chat {chat_id}")
+                except Exception as e:
+                    logger.error(f"Error stopping for user {user_id}: {e}")
         
-        if user_id == OWNER_ID and default_calls and "default" in active_streams:
-            try:
-                chat_id = active_streams["default"]
-                await default_calls.leave_group_call(chat_id)
-                del active_streams["default"]
-                stopped = True
-            except:
-                pass
+        # For owner: also check default account (backward compatibility)
+        elif user_id == OWNER_ID and "default" in active_streams:
+            if default_calls:
+                try:
+                    chat_id = active_streams["default"]
+                    
+                    # Get chat name
+                    try:
+                        chat = await default_account.get_chat(chat_id)
+                        chat_name = chat.title
+                    except:
+                        chat_name = f"Chat {chat_id}"
+                    
+                    await default_calls.leave_group_call(chat_id)
+                    del active_streams["default"]
+                    stopped = True
+                    logger.info(f"✅ Default account stopped playing in chat {chat_id}")
+                except Exception as e:
+                    logger.error(f"Error stopping default account: {e}")
         
         if stopped:
-            await message.reply_text("✅ Stopped playing audio!")
+            if chat_name:
+                await message.reply_text(f"✅ **Stopped playing!**\n\n📻 **Group:** {chat_name}")
+            else:
+                await message.reply_text("✅ **Stopped playing audio!**")
         else:
-            await message.reply_text("❌ No active audio playing!")
+            await message.reply_text("❌ **No active audio playing!**\n\nYou don't have any active streams.")
+    
     except Exception as e:
         logger.error(f"Stop error: {e}")
         await message.reply_text(f"❌ Error: {str(e)}")
+        await send_error_to_owner(f"Stop command error: {str(e)}")
 
 @bot.on_message(filters.command("logout") & filters.private)
 async def logout_command(client, message: Message):
@@ -954,11 +986,9 @@ async def message_handler(client, message: Message):
         elif state.step == "waiting_chat_id":
             chat_id_input = text.strip()
             
-            # Try to parse as chat_id
             try:
                 actual_chat_id = int(chat_id_input)
                 
-                # Store in state
                 state.data["actual_chat_id"] = actual_chat_id
                 state.step = "audio_input"
                 
@@ -993,7 +1023,7 @@ async def message_handler(client, message: Message):
             
             state.data["chat_info"] = chat_info
             
-            # NEW: For private groups, ask for chat_id immediately
+            # For private groups, ask for chat_id immediately
             if chat_info["type"] == "invite":
                 mode = state.data.get("mode")
                 
@@ -1009,14 +1039,12 @@ async def message_handler(client, message: Message):
                     state.step = None
                     return
                 
-                # Try smart method first
                 processing_msg = await message.reply_text("⏳ Checking group access...")
                 success, actual_chat_id, chat_title, error_msg, needs_chat_id = await get_chat_id_smart(
                     client_to_use, chat_info, stream_key
                 )
                 
                 if success and actual_chat_id:
-                    # Success! Store and move to audio input
                     state.data["actual_chat_id"] = actual_chat_id
                     state.data["chat_title"] = chat_title
                     state.step = "audio_input"
@@ -1029,15 +1057,12 @@ async def message_handler(client, message: Message):
                         "• YouTube URL 📺"
                     )
                 elif needs_chat_id:
-                    # Need chat_id from user
                     state.step = "waiting_chat_id"
                     await processing_msg.edit_text(error_msg)
                 else:
-                    # Other error
                     await processing_msg.edit_text(error_msg)
                     state.step = None
             else:
-                # Public group - go directly to audio input
                 state.step = "audio_input"
                 await message.reply_text(
                     "🎵 **Send Audio**\n\n"
@@ -1071,13 +1096,11 @@ async def message_handler(client, message: Message):
 
             processing_msg = await message.reply_text("⏳ Processing...")
 
-            # Get chat_id (use stored one for private groups with chat_id, or smart method for others)
+            # Get chat_id
             if "actual_chat_id" in state.data:
-                # Already have chat_id (from previous step)
                 actual_chat_id = state.data["actual_chat_id"]
                 chat_title = state.data.get("chat_title", "Group")
             else:
-                # Get via smart method (for public groups)
                 await processing_msg.edit_text("⏳ Getting group info...")
                 success, actual_chat_id, chat_title, error_msg, needs_chat_id = await get_chat_id_smart(
                     client_to_use, chat_info, stream_key
@@ -1105,7 +1128,13 @@ async def message_handler(client, message: Message):
                     stream_type=StreamType().pulse_stream
                 )
                 
-                active_streams[stream_key] = actual_chat_id
+                # NEW: Store with proper key (user_id for custom accounts, "default" for default account)
+                if mode == "custom":
+                    active_streams[user_id] = actual_chat_id
+                else:
+                    active_streams["default"] = actual_chat_id
+                
+                logger.info(f"✅ Stream started - Key: {stream_key}, Chat: {actual_chat_id}")
                 
                 await processing_msg.edit_text(
                     f"✅ **Now Playing!**\n\n"
@@ -1118,7 +1147,6 @@ async def message_handler(client, message: Message):
             except Exception as e:
                 error_msg = str(e)
                 
-                # NEW: Try rejoin strategy if normal join fails
                 if any(x in error_msg for x in ["No active group call", "GROUP_CALL_INVALID", "not found", "GROUPCALL_FORBIDDEN"]):
                     await processing_msg.edit_text("⏳ Trying rejoin strategy...")
                     
@@ -1127,6 +1155,12 @@ async def message_handler(client, message: Message):
                     )
                     
                     if rejoin_success:
+                        # Store stream info
+                        if mode == "custom":
+                            active_streams[user_id] = actual_chat_id
+                        else:
+                            active_streams["default"] = actual_chat_id
+                        
                         await processing_msg.edit_text(
                             f"✅ **Now Playing!** (via rejoin)\n\n"
                             f"📻 **Group:** {chat_title}\n"
@@ -1222,7 +1256,13 @@ async def audio_file_handler(client, message: Message):
                 stream_type=StreamType().pulse_stream
             )
             
-            active_streams[stream_key] = actual_chat_id
+            # NEW: Store with proper key
+            if mode == "custom":
+                active_streams[user_id] = actual_chat_id
+            else:
+                active_streams["default"] = actual_chat_id
+            
+            logger.info(f"✅ Stream started - Key: {stream_key}, Chat: {actual_chat_id}")
             
             await processing_msg.edit_text(
                 f"✅ **Now Playing!**\n\n"
@@ -1235,7 +1275,6 @@ async def audio_file_handler(client, message: Message):
         except Exception as e:
             error_msg = str(e)
             
-            # Try rejoin strategy
             if any(x in error_msg for x in ["No active group call", "GROUP_CALL_INVALID", "not found", "GROUPCALL_FORBIDDEN"]):
                 await processing_msg.edit_text("⏳ Trying rejoin strategy...")
                 
@@ -1244,6 +1283,12 @@ async def audio_file_handler(client, message: Message):
                 )
                 
                 if rejoin_success:
+                    # Store stream info
+                    if mode == "custom":
+                        active_streams[user_id] = actual_chat_id
+                    else:
+                        active_streams["default"] = actual_chat_id
+                    
                     await processing_msg.edit_text(
                         f"✅ **Now Playing!** (via rejoin)\n\n"
                         f"📻 **Group:** {chat_title}\n"
@@ -1289,9 +1334,9 @@ if __name__ == "__main__":
         logger.info("🚀 Starting VC Fighting Bot...")
         logger.info(f"Owner ID: {OWNER_ID}")
         logger.info(f"API ID: {API_ID}")
-        logger.info("✅ ULTRA FIXED VERSION - All Group Types Supported!")
-        logger.info("🔥 NEW: Chat ID Request for Private Groups")
-        logger.info("🔥 NEW: Emergency Rejoin Strategy")
+        logger.info("✅ COMPLETE VERSION - Sudo Users /stop Fixed!")
+        logger.info("🔥 Each user has independent stream control")
+        logger.info("🔥 /stop only affects the user who executed it")
         logger.info("Powered by @zudo_userbot")
         bot.run()
     except KeyboardInterrupt:
